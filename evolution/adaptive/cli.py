@@ -17,6 +17,7 @@ SUCCESS = {
 }
 COST = {"direct": 0.1, "structured": 0.4, "tool_assisted": 0.9}
 TIME = {"direct": 0.1, "structured": 0.4, "tool_assisted": 0.9}
+SKILL_VERSION = "synthetic-sim/1"  # no real Hermes skills are used here
 
 
 def main() -> None:
@@ -29,7 +30,6 @@ def main() -> None:
         parser.error("--episodes must be positive")
     rng = random.Random(args.seed)
     policy = ContextualBandit(STRATEGIES, epsilon=0.15, seed=args.seed)
-    store = ExperienceStore(args.db)
 
     def executor(context, strategy):
         rate = SUCCESS[context][STRATEGIES.index(strategy)]
@@ -40,16 +40,17 @@ def main() -> None:
         return Reward(result["quality"], result["cost"], result["time"])
 
     rewards = []
-    for _ in range(args.episodes):
-        context = rng.choice(CONTEXTS)
-        record = choose_strategy(policy, context, executor, verifier, store)
-        rewards.append(record["reward"])
+    with ExperienceStore(args.db) as store:  # closed even if an episode raises
+        for _ in range(args.episodes):
+            context = rng.choice(CONTEXTS)
+            record = choose_strategy(policy, context, executor, verifier, store,
+                                     skill_version=SKILL_VERSION)
+            rewards.append(record["reward"])
     print(f"Synthetic episodes: {args.episodes}; average utility: {sum(rewards)/len(rewards):.3f}")
     for context in CONTEXTS:
         print(f"{context}: " + ", ".join(
             f"{a} n={policy.counts.get((context,a),0)} "
             f"mean={policy.means.get((context,a),0):.3f}" for a in STRATEGIES))
-    store.close()
 
 
 if __name__ == "__main__":
