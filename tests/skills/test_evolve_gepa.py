@@ -293,6 +293,7 @@ def test_evolve_end_to_end_writes_a_changed_skill(tmp_path, monkeypatch):
     metrics = json.loads((run_dir / "metrics.json").read_text())
     assert metrics["optimizer"] == "dspy.GEPA"
     assert metrics["gepa_budget"] == {"max_metric_calls": 40}
+    assert "iterations" in metrics and metrics["iterations"] is None   # old schema key kept
     assert metrics["optimizer_model"] == "stub/reflection"
     assert metrics["metric"] == "keyword-overlap" and metrics["skill_changed"] is True
     assert metrics["evolved_score"] > metrics["baseline_score"]

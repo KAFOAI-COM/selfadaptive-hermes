@@ -332,6 +332,9 @@ def evolve(
         "optimizer": "dspy.GEPA",
         "dspy_version": getattr(dspy, "__version__", "unknown"),
         "gepa_budget": budget,
+        # Kept for readers of the old schema (scalar): GEPA max_full_evals, or
+        # None when --auto / --max-metric-calls set the budget.
+        "iterations": budget.get("max_full_evals"),
         "optimizer_model": optimizer_model,
         "reflection_lm_kwargs": REFLECTION_LM_KWARGS,
         "eval_model": eval_model,
