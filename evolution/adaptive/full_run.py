@@ -11,17 +11,18 @@ Stages, in order (``--stages`` selects a subset; state is resumable):
 3. ``gepa``       one real ``dspy.GEPA`` run on the skill text. Data: the
                   python_review TRAIN split only (20 GEPA-train / 8 GEPA-val);
                   metric: the gate 3 verifier F1 with verifier feedback.
-4. ``admission``  register the GEPA output as ``proposed`` (gate 5), run the
-                  gate 6 admission check against the baseline on validation,
-                  and, only if admitted, the gate 7 checkpoint ->
-                  admit -> validate -> keep-or-roll-back cycle.
+4. ``admission``  register the GEPA output as ``proposed`` (gate 5), then
+                  ``admission.review_with_rollback``: gate 7 pre-admission
+                  checkpoint, gate 6 check against the baseline on
+                  validation, and if admitted the post-admission check that
+                  keeps the candidate or retires it and rolls back.
 
 Spend control: every paid call goes through one append-only JSONL ledger in
 the run directory. Before each fresh call the ledger reserves a worst-case
 amount and refuses (``BudgetExhausted``) once ``--stop-usd`` would be
 crossed. Hermes calls are keyed by their exact request plus a sample number,
 so a resumed run replays recorded outcomes instead of paying again, and
-stages share outcomes for identical requests (common random numbers).
+the canary's calls are reused by the comparison (same strategy and request).
 
 Default mode is a STUB dry run: the real ``HermesExecutor`` runs with a stub
 subprocess runner that never starts Hermes, and GEPA (if dspy is installed)
@@ -93,10 +94,6 @@ class BudgetExhausted(RuntimeError):
 
 class CanaryFailed(RuntimeError):
     """The canary showed the live setup cannot produce scorable replies."""
-
-
-class GateSixRejected(RuntimeError):
-    """Gate 6 rejected the candidate inside gate 7's admit step."""
 
 
 class RunMismatch(RuntimeError):
@@ -225,8 +222,14 @@ class SpendLedger:
 
 
 def request_key(executor: HermesExecutor, task: Task, strategy: Strategy, sample: int) -> str:
-    """Identity of one Hermes request: what the agent sees, plus the sample number."""
+    """Identity of one Hermes request: what the agent sees, the strategy ID and the sample.
+
+    The strategy ID is part of the key so that gate 6's ``eval:`` arm and
+    gate 7's catalogue arm, which send identical requests, stay independent
+    samples instead of one replaying the other.
+    """
     return _sha256(_canonical({
+        "strategy_id": strategy.strategy_id,
         "prompt": task.prompt, "system_prompt": strategy.system_prompt,
         "toolsets": list(strategy.toolsets), "model": executor.model,
         "provider": executor.provider, "budget": asdict(executor.budget),
@@ -452,18 +455,15 @@ class FullRun:
 
     # 4 ------------------------------------------------------------------
     def admission(self) -> dict:
-        """Gate 5 registration, then gate 7 around gate 6.
+        """Gate 5 registration, then gate 6 + gate 7 via ``admission.review_with_rollback``.
 
-        Mirrors PR #8's composition (tests/test_admission_rollback.py): gate 7
-        validates the current policy and saves a ``good`` checkpoint FIRST;
-        the gate 6 review runs inside gate 7's ``admit`` step; a gate 6
-        rejection raises, so gate 7 restores the pre-admission checkpoint.
-        Known limit (pinned by PR #8): if gate 6 admits but gate 7 rolls back,
-        the registry entry stays ``admitted``; the active skill version and
-        the catalogue return to the baseline.
+        That function (PR #12) saves the pre-admission checkpoint of the
+        trained policy, runs the gate 6 review, and if admitted re-validates
+        the candidate's catalogue strategy; a drop beyond the rollback margin
+        or a critical violation retires the candidate and rolls back.
         """
-        from . import admission as adm        # gate 6 (PR #8)
-        from .checkpoint import CheckpointStore, admit_with_rollback, validation_utility
+        from . import admission as adm        # gates 6 and 7
+        from .checkpoint import CheckpointStore
         from .gepa_adapter import register_gepa_output
         from .registry import CandidateRegistry
 
@@ -482,57 +482,23 @@ class FullRun:
                                        provenance={"source": self.skill_source,
                                                    "run": RUN_VERSION})
             cand = register_gepa_output(registry, gepa["output_dir"], skill_name=SKILL_NAME)
-            candidate_text = registry.content(cand.candidate_id).decode("utf-8")
             out = {"candidate_id": cand.candidate_id, "parent_id": cand.parent_id,
                    "registered_status": registry.get(cand.candidate_id).status}
-            live_catalogue = {"current": dict(self.catalogue)}
-            decisions = []
-
-            def admit(policy) -> str:
-                decision = adm.review_registered(
-                    registry, cand.candidate_id, base=Strategy("review"),
-                    make_executor=lambda seed: self._exec("admission", sample=seed),
-                    apply=True)
-                decisions.append(decision)
-                if not decision.admitted:
-                    raise GateSixRejected("; ".join(decision.reasons))
-                live_catalogue["current"] = {
-                    **self.catalogue, "skill": Strategy("skill", system_prompt=candidate_text)}
-                return cand.candidate_id
-
-            def validate(policy):
-                return validation_utility(policy, self._exec("gate7"), review_quality,
-                                          live_catalogue["current"], self.encoder, SCORING,
-                                          prompt_template=REVIEW_TEMPLATE)
-
             policy = self.trained_policy(self._exec("compare"))
-            try:
-                result = admit_with_rollback(
-                    store, policy, skill_version=self.state["baseline_id"], admit=admit,
-                    validate=validate, label=f"admission:{cand.candidate_id}")
-            except GateSixRejected as exc:
-                result = None
-                out.update(status="rejected", reason=f"gate 6 rejected: {exc}",
-                           gate7={"admitted": False, "rolled_back": True,
-                                  "reason": "pre-admission checkpoint restored after "
-                                            "gate 6 rejection",
-                                  "active_skill_version": self.state["baseline_id"]})
-            if decisions:
-                out["decision"] = decisions[-1].to_dict()
-            out["registry_status"] = registry.get(cand.candidate_id).status
-            if result is not None:
-                if not result.admitted:
-                    live_catalogue["current"] = dict(self.catalogue)
-                out["gate7"] = {"admitted": result.admitted, "reason": result.reason,
-                                "rolled_back": not result.admitted,
-                                "pre_validation": result.pre_validation.to_dict(),
-                                "post_validation": (result.post_validation.to_dict()
-                                                    if result.post_validation else None),
-                                "active_skill_version": result.skill_version}
-                out["status"] = "admitted" if result.admitted else "rolled_back"
-            out["gate7"]["checkpoint_log"] = store.log()
-            out["active_catalogue"] = {k: _sha256(v.system_prompt)[:12]
-                                       for k, v in live_catalogue["current"].items()}
+            res = adm.review_with_rollback(
+                registry, cand.candidate_id, base=Strategy("review"),
+                make_executor=lambda seed: self._exec("admission", sample=seed),
+                store=store, policy=policy)
+            out.update({
+                "status": ("kept" if res.kept else "rolled_back" if res.rolled_back
+                           else "rejected"),
+                "reason": res.reason, "decision": res.decision.to_dict(),
+                "active_skill": res.active_skill,
+                "registry_status": registry.get(cand.candidate_id).status,
+                "pre_validation": res.pre_validation.to_dict(),
+                "post_validation": (res.post_validation.to_dict()
+                                    if res.post_validation else None),
+                "checkpoint_log": store.log()})
         return out
 
     # ------------------------------------------------------------------
