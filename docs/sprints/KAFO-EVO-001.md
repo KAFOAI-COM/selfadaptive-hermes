@@ -124,6 +124,18 @@ Hermes improves on any real task.**
       **stubbed GEPA output directory only; no live GEPA/LLM run**. Admission is
       the next gate).
 - [ ] Require candidate-vs-baseline validation before candidate admission.
+      Gate delivered in `evolution/adaptive/admission.py` (synthetic tests only,
+      FakeExecutor): candidate and baseline run on the same validation cases, with
+      the same executor factory and seeds (0, 1, 2), inside `optimisation_phase()`.
+      The verifier scores them. Admission needs a mean utility gain >= 0.05, a
+      95% paired bootstrap CI above 0, and zero violations; otherwise it rejects
+      and logs every failed rule. Thresholds are a frozen `ADMISSION_POLICY` that
+      `admit()` does not take as arguments; its SHA-256 is pinned in tests and
+      recorded in every decision. `review_registered` applies the decision to a
+      gate 5 registry entry (dry run by default). **Open:** gate 5's
+      `transition(..., "admitted")` accepts any non-empty evidence, so admission is
+      not yet *required* to pass this gate. Tick once the registry only admits with
+      an admission-gate decision.
 - [x] Implement policy/skill checkpoint and rollback.
       (`evolution/adaptive/checkpoint.py`, PR #9; 45 offline tests, full suite
       475 passed on GitHub Actions. See "Checkpoint and rollback (gate 7)".

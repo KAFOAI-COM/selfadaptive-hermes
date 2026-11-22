@@ -399,6 +399,7 @@ _GUARDED_ENTRY_POINTS = (
     (Path("evolution/adaptive/compare.py"), "compare"),
     (Path("evolution/adaptive/checkpoint.py"), "admit_with_rollback"),
     (Path("evolution/adaptive/checkpoint.py"), "validation_utility"),
+    (Path("evolution/adaptive/admission.py"), "admit"),
 )
 
 
