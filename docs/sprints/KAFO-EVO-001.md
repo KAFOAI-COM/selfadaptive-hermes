@@ -100,10 +100,11 @@ Hermes improves on any real task.**
       GitHub Actions. Run on the gate 2 benchmark via `evolution/adaptive/evaluation.py`:
       a ground-truth review scores 1.0 and an empty review 0.0 (micro P/R/F1) on
       train and validation; synthetic data, not a Hermes measurement).
-- [ ] Compare fixed, random, epsilon-greedy and LinUCB policies.
-      Policies and harness delivered; compared on **synthetic data only**
-      (see "Policy comparison (gate 4)"). Stays open until the comparison runs on
-      the gate 2 benchmark with the gate 3 verifier.
+- [x] Compare fixed, random, epsilon-greedy and LinUCB policies.
+      Comparison implemented and run (PR #5). Result: no improvement over the
+      best fixed strategy on validation (CI includes 0); adaptive policies beat
+      random. Synthetic data only. (Owner decision, 2026-11-22; see
+      "Policy comparison (gate 4)".)
 - [x] Preserve train / validation / sealed test separation.
       The adaptive loop (`core.choose_strategy`), its CLI (`cli.main`) and the
       gate 4 harness (`compare.compare`) run inside `benchmark.optimisation_phase()`,
