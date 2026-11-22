@@ -393,11 +393,13 @@ def test_compare_fails_if_it_touches_sealed_split(open_benchmark, attack):
 
 
 # Optimisation entry points that must run their body inside optimisation_phase().
-_GUARDED_ENTRY_POINTS = {
-    Path("evolution/adaptive/core.py"): "choose_strategy",
-    Path("evolution/adaptive/cli.py"): "main",
-    Path("evolution/adaptive/compare.py"): "compare",
-}
+_GUARDED_ENTRY_POINTS = (
+    (Path("evolution/adaptive/core.py"), "choose_strategy"),
+    (Path("evolution/adaptive/cli.py"), "main"),
+    (Path("evolution/adaptive/compare.py"), "compare"),
+    (Path("evolution/adaptive/checkpoint.py"), "admit_with_rollback"),
+    (Path("evolution/adaptive/checkpoint.py"), "validation_utility"),
+)
 
 
 def _is_phase_call(expr) -> bool:
@@ -408,7 +410,7 @@ def _is_phase_call(expr) -> bool:
 
 def unguarded_entry_points(root: Path) -> list[str]:
     problems = []
-    for rel, name in _GUARDED_ENTRY_POINTS.items():
+    for rel, name in _GUARDED_ENTRY_POINTS:
         path = root / rel
         if not path.exists():
             problems.append(f"{rel}: missing")
@@ -431,7 +433,7 @@ def test_loop_cli_and_compare_entry_points_are_guarded():
 
 
 def test_entry_point_check_catches_an_unguarded_compare(tmp_path):
-    for rel in _GUARDED_ENTRY_POINTS:
+    for rel in {rel for rel, _ in _GUARDED_ENTRY_POINTS}:
         target = tmp_path / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(REPO / rel, target)
