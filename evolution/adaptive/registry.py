@@ -24,8 +24,13 @@ Schema (``SCHEMA_VERSION = "candidate-registry/1"``)
   or the GEPA adapter can admit a candidate.
 * Status changes only through :meth:`CandidateRegistry.transition`, which
   follows ``ALLOWED_TRANSITIONS``, requires ``reason``, ``decided_by`` and an
-  ``evidence`` object (non-empty for ``admitted``), and appends a row to an
-  append-only history. SQLite triggers refuse edits to history rows and to a
+  ``evidence`` object, and appends a row to an append-only history.
+* ``admitted`` requires a gate 6 admission decision as evidence:
+  ``admitted`` is true, ``candidate_id`` matches, and ``policy_sha256`` is a
+  fingerprint registered by ``evolution.adaptive.admission`` through
+  :func:`register_admission_policy` (done when that module is imported). With
+  no registered policy, nothing can be admitted. This module does not import
+  the admission gate, so it stays free of scoring code. SQLite triggers refuse edits to history rows and to a
   candidate's identity or content.
 
 Connection to strategies
@@ -71,6 +76,10 @@ ALLOWED_TRANSITIONS: Mapping[str, frozenset[str]] = MappingProxyType({
 
 _SKILL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
+# Admission policy fingerprints registered by evolution.adaptive.admission.
+_ADMISSION_POLICIES: set[str] = set()
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
 
 class RegistryError(Exception):
     """Base class for registry errors."""
@@ -82,6 +91,34 @@ class TransitionError(RegistryError, ValueError):
 
 class IntegrityError(RegistryError):
     """Stored content no longer matches its recorded hash."""
+
+
+def register_admission_policy(fingerprint: str) -> None:
+    """Accept admission decisions made under this policy fingerprint.
+
+    Called by ``evolution.adaptive.admission`` at import; a static test
+    allows no other caller.
+    """
+    if not isinstance(fingerprint, str) or not _SHA256.match(fingerprint):
+        raise ValueError("fingerprint must be a lowercase SHA-256 hex digest")
+    _ADMISSION_POLICIES.add(fingerprint)
+
+
+def registered_admission_policies() -> frozenset[str]:
+    return frozenset(_ADMISSION_POLICIES)
+
+
+def _check_admission_evidence(candidate_id: str, evidence: Mapping) -> None:
+    if not _ADMISSION_POLICIES:
+        raise TransitionError("no admission policy is registered; admission must go "
+                              "through evolution.adaptive.admission")
+    if evidence.get("admitted") is not True:
+        raise TransitionError("admission evidence must be a decision with admitted=true")
+    if evidence.get("policy_sha256") not in _ADMISSION_POLICIES:
+        raise TransitionError("admission evidence policy_sha256 is not a registered "
+                              "admission policy")
+    if evidence.get("candidate_id") != candidate_id:
+        raise TransitionError("admission evidence is for a different candidate")
 
 
 def content_sha256(content: bytes) -> str:
@@ -271,8 +308,8 @@ class CandidateRegistry:
                    decided_by: str, evidence: Mapping) -> Candidate:
         """Change status along ALLOWED_TRANSITIONS and record why.
 
-        Admission (``admitted``) needs non-empty ``evidence``, for example the
-        candidate-vs-baseline validation result. This module never calls it.
+        Admission (``admitted``) needs a gate 6 decision as ``evidence`` (see
+        the module docstring). This module never calls it.
         """
         current = self.get(candidate_id)
         if to_status not in STATUSES:
@@ -284,6 +321,8 @@ class CandidateRegistry:
         _check_text(decided_by, "decided_by")
         evidence_json = _json_object(evidence, "evidence", nonempty=to_status == ADMITTED)
         self.content(candidate_id)  # refuse to act on tampered content
+        if to_status == ADMITTED:
+            _check_admission_evidence(candidate_id, evidence)
         at = _now()
         with self.conn:
             updated = self.conn.execute(
@@ -370,6 +409,25 @@ def candidate_strategy(registry: CandidateRegistry, candidate_id: str,
                             "may enter the strategy catalogue")
     text = registry.content(candidate_id).decode("utf-8")
     return Strategy(strategy_id=f"{base.strategy_id}:{cand.candidate_id}",
+                    system_prompt=text, toolsets=base.toolsets)
+
+
+def evaluation_strategy(registry: CandidateRegistry, candidate_id: str,
+                        base: Strategy) -> Strategy:
+    """Strategy for EVALUATING a proposed candidate (or its admitted baseline).
+
+    Same rule as :func:`candidate_strategy` (skill text as system prompt, tools
+    from ``base`` only), but the ID is prefixed ``eval:`` so it can never be
+    mistaken for a catalogue strategy. It changes no status and never admits;
+    only :func:`candidate_strategy` and :func:`admitted_strategies` build
+    catalogue strategies, and they accept admitted candidates only.
+    """
+    cand = registry.get(candidate_id)
+    if cand.status not in (PROPOSED, ADMITTED):
+        raise RegistryError(f"{candidate_id} is {cand.status}; only proposed candidates "
+                            "and admitted baselines can be evaluated")
+    text = registry.content(candidate_id).decode("utf-8")
+    return Strategy(strategy_id=f"eval:{base.strategy_id}:{cand.candidate_id}",
                     system_prompt=text, toolsets=base.toolsets)
 
 
