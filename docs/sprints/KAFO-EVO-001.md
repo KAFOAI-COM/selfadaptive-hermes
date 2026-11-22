@@ -161,10 +161,14 @@ Hermes improves on any real task.**
       files equal fresh output. **Synthetic**, apart from the 4-case live smoke
       run, which is labelled a plumbing check. Headline, derived from the
       verdicts: no adaptive policy beats the best fixed strategy on validation.
-      The one-time final test evaluation is built but **not run**: owner decision.
-      It will be the pre-registered paired run
-      (`final_evaluation.run_paired_final_evaluation`, run-once ledger); see
-      "Pre-registered analysis plan" below.)
+      The one-time final test evaluation **ran once on 2026-11-22**, after owner
+      approval, as the pre-registered paired run
+      (`final_evaluation.run_paired_final_evaluation`). The run-once ledger is
+      `reports/kafo-evo-001/final_test_evaluation.json`, and the scores and paired
+      CIs are in the report. Primary (strict micro-F1, candidate minus baseline):
+      0.302 [0.157, 0.462]. That meets the pre-registered rule on **synthetic**
+      hand-written cases only; it is not evidence of a real Hermes improvement.
+      See "Pre-registered analysis plan" below.)
 
 ## Hermes executor (gate 1)
 
