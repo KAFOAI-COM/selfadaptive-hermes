@@ -66,6 +66,13 @@ load_split("test", allow_sealed_test=True)  # final evaluation only
 
 Loading train or validation never opens the sealed file.
 
+During optimisation or selection, wrap the work in
+`evolution.adaptive.benchmark.optimisation_phase()` (the adaptive loop already
+does). Inside it the test split cannot be loaded, and opening any file under
+`python_review/.../sealed/` raises `SealedSplitError`. Score reviews with
+`evolution.adaptive.evaluation.evaluate_open`. The one-off final evaluation is
+`evaluate_sealed_test(reviews, final_evaluation=True)`, run outside optimisation.
+
 Read-only checks:
 
 ```bash

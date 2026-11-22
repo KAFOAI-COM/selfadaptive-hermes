@@ -96,9 +96,18 @@ Hermes improves on any real task.**
 - [x] Build independent verifier with reproducible precision/recall scoring
       (`evolution/adaptive/verifier.py`, stdlib-only, no LLM judge; 61 unit
       tests on small synthetic inline fixtures, full suite 246 passed on
-      GitHub Actions. Not yet run on the gate 2 benchmark).
+      GitHub Actions. Run on the gate 2 benchmark via `evolution/adaptive/evaluation.py`:
+      a ground-truth review scores 1.0 and an empty review 0.0 (micro P/R/F1) on
+      train and validation; synthetic data, not a Hermes measurement).
 - [ ] Compare fixed, random, epsilon-greedy and LinUCB policies.
 - [ ] Preserve train / validation / sealed test separation.
+      Done for merged code: the loop (`core.choose_strategy`, `cli`) runs inside
+      `benchmark.optimisation_phase()`, which blocks loading or opening the sealed
+      split in-process; `verifier.load_cases` refuses sealed cases; only
+      `evaluation.evaluate_sealed_test(final_evaluation=True)` unseals; a static
+      scan of `evolution/` enforces this. **Open:** the gate 4 harness (PR #5)
+      passes the static scan, but `compare()` must also run inside
+      `optimisation_phase()` before this is ticked.
 - [ ] Connect GEPA skill-candidate generation to the strategy registry.
 - [ ] Require candidate-vs-baseline validation before candidate admission.
 - [ ] Implement policy/skill checkpoint and rollback.

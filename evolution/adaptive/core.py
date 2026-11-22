@@ -14,6 +14,8 @@ import random
 import sqlite3
 from pathlib import Path
 
+from .benchmark import optimisation_phase
+
 # Reward contract (see docs/sprints/KAFO-EVO-001.md, "Reward range"):
 #   valid outcome  -> quality - cost_weight*min(cost_ratio, RATIO_CAP)
 #                             - time_weight*min(time_ratio, RATIO_CAP)
@@ -218,10 +220,14 @@ def choose_strategy(policy: ContextualBandit, context: str,
     independent verifier(result)->Reward and the version of the skill
     catalogue in use. No production actions permitted by this module.
     The caller is responsible for sandboxing the executor.
+
+    The iteration runs inside ``benchmark.optimisation_phase()``: the executor
+    and verifier cannot load or open the sealed test split.
     """
     strategy, propensity = policy.select(context)   # PLAN
-    result = executor(context, strategy)            # EXECUTE
-    outcome = verifier(result)                      # MONITOR / ANALYSE
+    with optimisation_phase():
+        result = executor(context, strategy)        # EXECUTE
+        outcome = verifier(result)                  # MONITOR / ANALYSE
     if not isinstance(outcome, Reward):
         raise TypeError("verifier must return Reward")
     reward = score_outcome(outcome)                  # LEGITIMISE

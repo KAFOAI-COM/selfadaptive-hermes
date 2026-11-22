@@ -372,7 +372,7 @@ def _write_jsonl(path, rows):
 def test_jsonl_roundtrip_and_cli_is_read_only(tmp_path, capsys):
     cases_path, reviews_path = tmp_path / "cases.jsonl", tmp_path / "reviews.jsonl"
     _write_jsonl(cases_path, [make_case("a", THREE, split="train"),
-                              make_case("b", THREE, split="test")])
+                              make_case("b", THREE, split="validation")])
     _write_jsonl(reviews_path, [{"case_id": "a", "findings": [finding(3)]},
                                 {"case_id": "b", "findings": []}])
     before = {p: p.read_bytes() for p in (cases_path, reviews_path)}

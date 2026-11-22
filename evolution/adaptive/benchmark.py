@@ -17,6 +17,14 @@ Sealing: ``load_split("test")`` raises :class:`SealedSplitError` unless the
 caller passes ``allow_sealed_test=True``. Loading open splits never opens the
 sealed file.
 
+Separation during optimisation: code that optimises or selects (the adaptive
+loop, policy comparison) runs inside :func:`optimisation_phase`. While any
+optimisation phase is active in the process, the sealed split cannot be
+loaded even with ``allow_sealed_test=True``, and a Python audit hook makes any
+``open()`` of a file under a ``python_review/.../sealed/`` directory raise
+:class:`SealedSplitError`. The hook covers this process only, not
+subprocesses.
+
 The snippets are hand-written synthetic examples with seeded defects. A score
 on this benchmark is not evidence that Hermes improves on real code review.
 
@@ -25,13 +33,16 @@ Dependency-free (standard library only) and never writes to disk.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import logging
+import os
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -344,6 +355,69 @@ def _parse_jsonl(data: bytes, split: str, schema: dict,
     return tuple(cases)
 
 
+# ── Optimisation phase guard ─────────────────────────────────────────────────
+
+_phase_lock = threading.Lock()
+_phase_depth = 0
+_sealed_attempts = 0
+_hook_installed = False
+
+
+def _is_sealed_path(path: str) -> bool:
+    parts = Path(os.path.realpath(path)).parts
+    if BENCHMARK_NAME not in parts:
+        return False
+    return "sealed" in parts[parts.index(BENCHMARK_NAME) + 1:]
+
+
+def _audit_hook(event: str, args: tuple) -> None:
+    global _sealed_attempts
+    if event != "open" or not _phase_depth or not args:
+        return
+    target = args[0]
+    if not isinstance(target, (str, bytes, os.PathLike)):
+        return   # file descriptors and other targets
+    if _is_sealed_path(os.fsdecode(target)):
+        with _phase_lock:
+            _sealed_attempts += 1
+        raise SealedSplitError("sealed benchmark data opened during an optimisation "
+                               f"phase: {os.fsdecode(target)}")
+
+
+def _install_hook() -> None:
+    global _hook_installed
+    with _phase_lock:
+        if not _hook_installed:
+            sys.addaudithook(_audit_hook)   # audit hooks cannot be removed
+            _hook_installed = True
+
+
+@contextmanager
+def optimisation_phase() -> Iterator[None]:
+    """Mark the process as optimising or selecting (re-entrant, thread-safe).
+
+    Inside it the sealed split cannot be loaded or opened in this process.
+    """
+    global _phase_depth
+    _install_hook()
+    with _phase_lock:
+        _phase_depth += 1
+    try:
+        yield
+    finally:
+        with _phase_lock:
+            _phase_depth -= 1
+
+
+def in_optimisation_phase() -> bool:
+    return _phase_depth > 0
+
+
+def sealed_access_attempts() -> int:
+    """How many opens of sealed files the guard has blocked in this process."""
+    return _sealed_attempts
+
+
 # ── Public API ───────────────────────────────────────────────────────────────
 
 def _check_request(splits: tuple[str, ...], allow_sealed_test) -> None:
@@ -354,6 +428,9 @@ def _check_request(splits: tuple[str, ...], allow_sealed_test) -> None:
             raise SealedSplitError(
                 f"the {split!r} split is sealed for final evaluation; pass "
                 "allow_sealed_test=True only outside optimisation and selection")
+        if split in SEALED_SPLITS and in_optimisation_phase():
+            raise SealedSplitError(
+                f"the {split!r} split cannot be loaded during an optimisation phase")
 
 
 def load_split(split: str, *, version: str = DEFAULT_VERSION, root=None,
