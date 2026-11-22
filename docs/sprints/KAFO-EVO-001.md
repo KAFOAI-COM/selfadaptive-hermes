@@ -124,7 +124,13 @@ Hermes improves on any real task.**
       **stubbed GEPA output directory only; no live GEPA/LLM run**. Admission is
       the next gate).
 - [ ] Require candidate-vs-baseline validation before candidate admission.
-- [ ] Implement policy/skill checkpoint and rollback.
+- [x] Implement policy/skill checkpoint and rollback.
+      (`evolution/adaptive/checkpoint.py`, PR #9; 45 offline tests, full suite
+      475 passed on GitHub Actions. See "Checkpoint and rollback (gate 7)".
+      Limits: the trigger wraps a caller-supplied `admit`, because the admission
+      gate (candidate-vs-baseline validation) is still open; skill rollback
+      restores the skill version ID only and is not yet wired to the gate 5
+      candidate registry. Synthetic data only.)
 - [ ] Publish quality, utility, cost, latency, uncertainty and safety report.
 
 ## Hermes executor (gate 1)
@@ -273,6 +279,81 @@ measured against a baseline picked in hindsight on the same train data, so it
 does not show generalisation. Fixed-policy validation intervals have zero width
 because those runs are deterministic. **This is a hypothetical simulator: none
 of it is evidence about Hermes.**
+
+## Checkpoint and rollback (gate 7)
+
+`evolution/adaptive/checkpoint.py`. Checkpoints live in the SQLite knowledge
+store next to `ExperienceStore` (new tables `policy_checkpoints`,
+`checkpoint_log`, `checkpoint_active`; the experience schema and its
+`user_version` are unchanged). Pass an `ExperienceStore` to share its file.
+
+### What a checkpoint holds
+
+Sequence number, policy kind, policy version, active skill version, label,
+UTC creation time, the validation result it was saved with, and the policy
+state: epsilon-greedy counts and means, LinUCB `A^-1`, `b` and counts, and the
+RNG state for every seeded policy (fixed, random, epsilon-greedy, LinUCB,
+plain `ContextualBandit`). SHA-256 is taken over canonical JSON of the whole
+record. The duplicated metadata columns must match the checksummed payload.
+
+### Safety
+
+- **Whitelisted fields only.** Every field is type- and range-checked on
+  restore, and configuration (strategies, epsilon, LinUCB dim/alpha/ridge,
+  fixed action, policy version) must equal the live policy. A checkpoint
+  restores learned estimates, counts and RNG state only. It cannot change
+  hyperparameters, reward weights, budgets, permissions or evaluation data,
+  even with a recomputed checksum (tested).
+- **Verify before change.** Corruption (checksum, truncated or non-canonical
+  JSON, unknown kind, edited columns, bad state fields, bad RNG state) raises
+  `CheckpointCorrupted`. The live policy and the store stay unchanged and a
+  `corruption_detected` event is logged.
+- **Atomic, logged rollback.** Status change, active pointer and the log row
+  are written in one SQLite transaction. The in-memory policy changes only
+  after commit. Tests inject a failure at the log write and at the pointer
+  update and check that nothing changed.
+- **Policy lines.** One store can hold several policies. Each checkpoint
+  belongs to the line `(kind, policy_version)`; the active pointer and "last
+  good" are per line, so a policy never rolls back onto another policy's
+  checkpoint (tested). Two live policies with the same kind and version need
+  separate stores.
+- **Last good.** Rollback targets the newest `good` checkpoint on the same
+  line that is older than the rejected one. A corrupt target is marked `corrupt` and skipped. If none
+  verifies, rollback fails closed (`NoGoodCheckpoint`). A rolled-back
+  checkpoint is never a target again.
+- **Idempotent restore.** Restoring twice gives the same state, and the next
+  decisions match the policy at save time (RNG restored). Tested for all five
+  policy kinds and after reopening the database.
+
+### Rollback trigger
+
+`admit_with_rollback(store, policy, skill_version=..., admit=..., validate=...)`:
+validate and save a `good` pre-admission checkpoint, call `admit(policy)`
+(returns the new skill version), validate again and save a `candidate`. Roll
+back if post-admission validation utility is strictly below the pre-admission
+checkpoint's recorded utility minus `ROLLBACK_MARGIN` (fixed at 0.02 utility,
+not a parameter), or on any critical violation even if utility rose.
+Otherwise promote the candidate. If `admit` or validation raises, the
+pre-admission checkpoint is restored before the error propagates. Validation
+gets a deep copy, so it never changes the live policy.
+
+`validation_utility(...)` is the standard `validate`: it loads only the
+`validation` split through `benchmark.load_benchmark` inside
+`optimisation_phase()` and runs the policy with learning off. Both entry
+points are in the guarded list in `tests/test_benchmark_integration.py`.
+
+### Limits
+
+- No candidate-admission gate exists yet (candidate-vs-baseline validation is
+  still open). The trigger is a callable the future admission step runs;
+  `admit` is supplied by the caller. The gate 5 registry (`registry.py`) is not
+  yet wired in: `skill_version` is a free string, not a registry candidate ID.
+- The skill version is an identifier only. Restore and rollback return it;
+  nothing deploys, rewrites or rolls back skill files.
+- Checkpoint status is lifecycle metadata outside the checksum. The checksum
+  detects corruption; it is not a signature.
+- All results in the tests are **synthetic** (hand-written benchmark, fake
+  executor). No live Hermes run.
 
 ## Sealed test evaluation (owner decision, 2026-11-22)
 
