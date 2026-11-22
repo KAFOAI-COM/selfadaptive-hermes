@@ -271,11 +271,16 @@ def test_loop_fails_if_optimisation_code_touches_sealed_split(open_benchmark, at
 
 # Only these may name benchmark internals or unseal the test split.
 _LOADER = Path("evolution/adaptive/benchmark.py")
-_UNSEAL_ALLOWED = {(Path("evolution/adaptive/evaluation.py"), "evaluate_sealed_test")}
+_UNSEAL_ALLOWED = {(Path("evolution/adaptive/evaluation.py"), "sealed_test_cases")}
 # The one recorded, run-once final evaluation (gate 8) is the only package code
-# that may call evaluate_sealed_test.
-_FINAL_CALL_ALLOWED = {(Path("evolution/adaptive/final_evaluation.py"),
-                        "run_final_evaluation")}
+# that may reach the sealed cases: per name, the (file, function) allowed to use it.
+_FINAL_CALL_ALLOWED = {
+    "evaluate_sealed_test": {(Path("evolution/adaptive/final_evaluation.py"),
+                              "run_final_evaluation")},
+    "sealed_test_cases": {(Path("evolution/adaptive/evaluation.py"), "evaluate_sealed_test"),
+                          (Path("evolution/adaptive/final_evaluation.py"),
+                           "run_paired_final_evaluation")},
+}
 _INTERNAL_NAMES = {"BENCHMARK_ROOT", "SPLIT_FILES", "_read_inside", "_read_verified",
                    "_parse_jsonl", "_read_manifest", "_phase_depth"}
 _PATH_FRAGMENTS = ("python_review/", "python_review\\", "sealed/", "sealed\\",
@@ -307,10 +312,11 @@ def _scan(path: Path, rel: Path) -> list[str]:
             if unsealing and (rel, function_of.get(id(node))) not in _UNSEAL_ALLOWED:
                 problems.append(f"{where}: passes allow_sealed_test outside final evaluation")
         elif (isinstance(node, (ast.Name, ast.Attribute))
-              and getattr(node, "id", getattr(node, "attr", None)) == "evaluate_sealed_test"
+              and (name := getattr(node, "id", getattr(node, "attr", None)))
+              in _FINAL_CALL_ALLOWED
               and isinstance(getattr(node, "ctx", None), ast.Load)
-              and (rel, function_of.get(id(node))) not in _FINAL_CALL_ALLOWED):
-            problems.append(f"{where}: calls evaluate_sealed_test from package code")
+              and (rel, function_of.get(id(node))) not in _FINAL_CALL_ALLOWED[name]):
+            problems.append(f"{where}: calls {name} from package code")
     return problems
 
 

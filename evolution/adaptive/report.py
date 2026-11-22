@@ -281,6 +281,8 @@ def final_evaluation_section(ledger_path: Path) -> dict:
         return {"status": "not run", "note": "the one-time final test evaluation has not "
                 "been run; when and on which reviewer is an owner decision"}
     record = json.loads(ledger_path.read_text(encoding="utf-8"))
+    if record.get("design") == "paired":
+        return _paired_section(record)
     keep = ("status", "started_at", "finished_at", "reviewer_id", "skill_version",
             "synthetic", "n_cases", "totals", "micro", "macro", "benchmark", "verifier",
             "error")
@@ -289,6 +291,77 @@ def final_evaluation_section(ledger_path: Path) -> dict:
     if isinstance(summary, dict):
         out["reviewer_summary"] = {k: v for k, v in summary.items() if k != "cases"}
     return out
+
+
+def _paired_section(record: Mapping) -> dict:
+    """The paired (schema /2) ledger: scores and differences, no per-case rows."""
+    keep = ("status", "started_at", "finished_at", "design", "reviewer_id", "synthetic",
+            "skill_versions", "analysis_plan", "analysis_plan_sha256", "primary",
+            "secondary", "n_cases", "paired", "benchmark", "verifier", "error")
+    out = {k: record[k] for k in keep if k in record}
+    alt = record.get("alternates") or {}
+    out["alternates"] = {k: alt.get(k) for k in ("table", "sha256", "n_defects")}
+    if "lenient_defects_in_split" in record:
+        out["alternates"]["defects_in_split"] = record["lenient_defects_in_split"]
+    if isinstance(record.get("scores"), dict):
+        out["scores"] = {name: {arm: {k: v for k, v in arm_rec.items() if k != "cases"}
+                                for arm, arm_rec in by_arm.items()}
+                         for name, by_arm in record["scores"].items()}
+    summaries = record.get("reviewer_summaries")
+    if isinstance(summaries, dict):
+        out["reviewer_summaries"] = {arm: {k: v for k, v in rs.items() if k != "cases"}
+                                     for arm, rs in summaries.items() if isinstance(rs, dict)}
+    return out
+
+
+def _paired_markdown(fe: Mapping) -> list[str]:
+    sv = fe.get("skill_versions", {})
+    L = [f"Status **{fe['status']}**, paired design, started {fe.get('started_at')}, "
+         f"finished {fe.get('finished_at')}, reviewer `{fe.get('reviewer_id')}`, synthetic: "
+         f"{fe.get('synthetic')}. Baseline `{sv.get('baseline')}`, candidate "
+         f"`{sv.get('candidate')}`. Pre-registered plan `{fe['analysis_plan']['id']}` "
+         f"(sha256 `{fe.get('analysis_plan_sha256', '')[:12]}`); lenient table "
+         f"`{fe['alternates'].get('table')}` (sha256 "
+         f"`{(fe['alternates'].get('sha256') or '')[:12]}`)."]
+    for arm, rs in (fe.get("reviewer_summaries") or {}).items():
+        if "error" in rs:
+            continue
+        L += ["", f"- {arm}: model `{rs.get('model')}` (provider `{rs.get('provider')}`), "
+              f"strategy `{rs.get('strategy_id')}`, cost USD {rs.get('total_cost_usd')} "
+              f"(statuses {rs.get('cost_statuses')}, shared cap "
+              f"{rs.get('max_total_cost_usd')}), calls {rs.get('calls')}, completed "
+              f"{rs.get('completed')}, unparseable {rs.get('unparseable')}, violations "
+              f"{rs.get('violations')}, exceptions {rs.get('exceptions')}, skipped "
+              f"{rs.get('skipped')}" + (f", stopped: {rs['stopped']}" if rs.get("stopped")
+                                        else "") + "."]
+    if fe["status"] == "completed":
+        L += ["", f"{fe['n_cases']} sealed test cases, the same for both skills.", "",
+              "| Scoring | Skill | Micro F1 | Micro precision | Micro recall | Macro F1 |",
+              "|---|---|---|---|---|---|"]
+        for name, label in (("strict", "STRICT (primary)"), ("lenient", "LENIENT (secondary)")):
+            for arm in ("baseline", "candidate"):
+                sc = fe["scores"][name][arm]
+                L.append(f"| {label} | {arm} | {_iv(sc['micro']['f1'])} | "
+                         f"{_iv(sc['micro']['precision'])} | {_iv(sc['micro']['recall'])} | "
+                         f"{_iv(sc['macro']['f1'])} |")
+        L += ["", "Paired difference, candidate minus baseline, 95% paired bootstrap CI:", "",
+              "| Scoring | Micro F1 | Macro F1 | Micro precision | Micro recall |",
+              "|---|---|---|---|---|"]
+        for name, label in (("strict", "STRICT (primary)"), ("lenient", "LENIENT (secondary)")):
+            d = fe["paired"][name]
+            L.append(f"| {label} | {_iv(d['micro_f1'])} | {_iv(d['macro_f1'])} | "
+                     f"{_iv(d['micro_precision'])} | {_iv(d['micro_recall'])} |")
+        primary = fe["paired"]["strict"]["micro_f1"]
+        verdict = ("above 0: the candidate is better on the sealed test under the "
+                   "pre-registered rule" if primary["low"] > 0 else
+                   "not above 0: no improvement shown on the sealed test under the "
+                   "pre-registered rule")
+        L += ["", f"Primary result: the strict micro-F1 difference's CI lower bound is "
+              f"{verdict}. Synthetic hand-written cases: not evidence of a real Hermes "
+              "improvement."]
+    elif fe.get("error"):
+        L += ["", f"Error: {fe['error']}"]
+    return L
 
 
 def _rel(path: Path) -> str:
@@ -522,9 +595,13 @@ def format_markdown(report: Mapping) -> str:
     fe = report["final_test_evaluation"]
     L += ["## Final test evaluation (one-time, recorded)", ""]
     if fe["status"] == "not run":
-        L += [_sentence(fe["note"]) + ". It is run by "
-              "`evolution.adaptive.final_evaluation.run_final_evaluation`, which refuses a "
-              "second run.", ""]
+        L += [_sentence(fe["note"]) + ". It will be the pre-registered paired run "
+              "(baseline and candidate skill on the same sealed cases; strict scoring "
+              "primary, lenient secondary; see docs/sprints/KAFO-EVO-001.md), through "
+              "`evolution.adaptive.final_evaluation.run_paired_final_evaluation`, which "
+              "refuses a second run.", ""]
+    elif fe.get("design") == "paired":
+        L += _paired_markdown(fe) + [""]
     else:
         L += [f"Status **{fe['status']}**, started {fe.get('started_at')}, finished "
               f"{fe.get('finished_at')}, reviewer `{fe.get('reviewer_id')}`, skill version "
