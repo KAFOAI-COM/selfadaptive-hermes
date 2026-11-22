@@ -50,8 +50,11 @@ NOTICE = ("SYNTHETIC RESULTS. The policy comparison uses a hypothetical simulato
           "is evidence that Hermes improves on any real task.")
 PENDING_ADMISSION = ("pending: gate 6 (candidate-vs-baseline admission) is not merged; "
                      "no candidate has been admitted or rejected by an admission check")
-PENDING_ROLLBACK = ("pending: gate 7 (policy/skill checkpoint and rollback) is not merged; "
-                    "no rollback mechanism exists yet, so 0 rollbacks is not a safety result")
+NO_CHECKPOINT_STORE = ("no checkpoint store supplied (--checkpoints). The gate 7 rollback "
+                       "mechanism (checkpoint.admit_with_rollback) is merged, but no admission "
+                       "has run, so there is no rollback history: 0 rollbacks is not a safety "
+                       "result")
+DEFAULT_LIVE_SMOKE = DEFAULT_OUT / "live_smoke_2026-11-22.json"
 NOISY_KEEP, NOISY_FALSE_ALARM = 0.7, 0.25
 
 
@@ -164,6 +167,16 @@ def headline(comparison: Mapping) -> list[str]:
     return lines
 
 
+def _with_live(lines: list[str], live: Mapping) -> list[str]:
+    if live["status"] != "supplied":
+        return lines
+    note = (f"A live Hermes smoke run scored {live['n_cases']} {live['split']} cases "
+            f"({live['completed']} completed, {live['violations']} violations). With so few "
+            "cases this is a plumbing check, not a quality estimate.")
+    return lines[:-1] + [note, "Apart from that smoke run, these are results from a "
+                         "hypothetical simulator, not from Hermes."]
+
+
 def _registry_summary(path: Optional[str]) -> dict:
     if path is None:
         return {"status": "not supplied", "note": "no candidate registry was given "
@@ -184,6 +197,28 @@ def _registry_summary(path: Optional[str]) -> dict:
                          for m in moves if m[2] == "rejected"],
             "retired": [dict(zip(("candidate_id", "from", "to", "reason", "decided_by"), m))
                         for m in moves if m[2] == "retired"]}
+
+
+def checkpoint_section(path: Optional[str]) -> dict:
+    """Read-only summary of a gate 7 checkpoint store (statuses and log events)."""
+    if path is None:
+        return {"status": "not supplied", "note": NO_CHECKPOINT_STORE}
+    uri = Path(path).resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        statuses = conn.execute("SELECT status, COUNT(*) FROM policy_checkpoints "
+                                "GROUP BY status ORDER BY status").fetchall()
+        events = conn.execute("SELECT event, COUNT(*) FROM checkpoint_log "
+                              "GROUP BY event ORDER BY event").fetchall()
+        rollbacks = conn.execute(
+            "SELECT checkpoint_id, from_checkpoint_id, reason FROM checkpoint_log "
+            "WHERE event='rollback' ORDER BY id").fetchall()
+    finally:
+        conn.close()
+    return {"status": "supplied",
+            "checkpoints": {k: n for k, n in statuses},
+            "events": {k: n for k, n in events},
+            "rollbacks": [{"to": t, "from": f, "reason": r} for t, f, r in rollbacks]}
 
 
 def _finite_or_none(value) -> Optional[float]:
@@ -219,6 +254,9 @@ def live_smoke_section(path: Optional[str]) -> dict:
         return sum(vals) / len(vals) if vals else None
 
     return {"status": "supplied", "source": str(data.get("source", "unspecified")),
+            "model": str(data.get("model", "unspecified")),
+            "split": str(data.get("split", "unspecified")),
+            "note": str(data.get("note", "")),
             "label": f"{len(rows)} live cases; a smoke test, not a benchmark result",
             "n_cases": len(rows), "completed": sum(r["completed"] for r in rows),
             "violations": sum(r["violation"] for r in rows),
@@ -247,7 +285,8 @@ def _rel(path: Path) -> str:
 
 def generate(*, seeds: int = 20, train_episodes: int = 300, benchmark_seed: int = 0,
              resamples: int = 2000, verifier_seed: int = 0, verifier_bootstrap: int = 1000,
-             registry_path: Optional[str] = None, live_smoke_path: Optional[str] = None,
+             registry_path: Optional[str] = None, checkpoint_path: Optional[str] = None,
+             live_smoke_path: Optional[str] = str(DEFAULT_LIVE_SMOKE),
              final_ledger_path: Path = DEFAULT_LEDGER,
              generated_at: Optional[str] = None) -> dict:
     """Build the report dict. Runs entirely inside optimisation_phase()."""
@@ -258,23 +297,31 @@ def generate(*, seeds: int = 20, train_episodes: int = 300, benchmark_seed: int 
             resamples=resamples)
         verifier_scores = verifier_section(seed=verifier_seed, n_bootstrap=verifier_bootstrap)
         registry = _registry_summary(registry_path)
+        checkpoints = checkpoint_section(checkpoint_path)
         live = live_smoke_section(live_smoke_path)
         final = final_evaluation_section(Path(final_ledger_path))
         blocked = sealed_access_attempts() - attempts_before
     total_steps = sum(c["steps"] for p in violations.values() for c in p.values())
     total_viol = sum(c["violations"] for p in violations.values() for c in p.values())
-    pending = [PENDING_ADMISSION, PENDING_ROLLBACK]
+    pending = [PENDING_ADMISSION]
+    if checkpoints["status"] == "not supplied":
+        pending.append("rollback history: none yet, because no admission has run")
     if live["status"] == "pending":
         pending.append("live Hermes smoke run: no results supplied")
     if final["status"] == "not run":
         pending.append("final test evaluation: not run (owner decision)")
     return {
         "schema": SCHEMA, "title": "KAFO-EVO-001 sprint report", "synthetic": True,
-        "notice": NOTICE, "generated_at": generated_at,
+        "notice": NOTICE if live["status"] != "supplied" else NOTICE + (
+            f" The only live data is a {live['n_cases']}-case Hermes smoke test, reported "
+            "separately as a plumbing check."),
+        "generated_at": generated_at,
         "settings": {"seeds": seeds, "train_episodes": train_episodes,
                      "benchmark_seed": benchmark_seed, "comparison_resamples": resamples,
                      "verifier_seed": verifier_seed, "verifier_resamples": verifier_bootstrap,
                      "registry": None if registry_path is None else Path(registry_path).name,
+                     "checkpoints": None if checkpoint_path is None
+                     else Path(checkpoint_path).name,
                      "live_smoke": None if live_smoke_path is None else Path(live_smoke_path).name,
                      "final_ledger": _rel(Path(final_ledger_path))},
         "provenance": {"benchmark": {"name": benchmark.BENCHMARK_NAME,
@@ -282,7 +329,7 @@ def generate(*, seeds: int = 20, train_episodes: int = 300, benchmark_seed: int 
                                      "manifest_sha256": benchmark.PINNED_MANIFEST_SHA256.get(
                                          benchmark.DEFAULT_VERSION)},
                        "verifier": verifier_scores.pop("provenance")},
-        "headline": headline(comparison),
+        "headline": _with_live(headline(comparison), live),
         "policy_comparison": comparison,
         "verifier_scores": verifier_scores,
         "safety": {"critical_violations": {"total_steps": total_steps,
@@ -291,7 +338,7 @@ def generate(*, seeds: int = 20, train_episodes: int = 300, benchmark_seed: int 
                    "sealed_access_blocked_during_generation": blocked,
                    "registry": registry,
                    "admission": {"status": "pending", "note": PENDING_ADMISSION},
-                   "rollbacks": {"status": "pending", "note": PENDING_ROLLBACK}},
+                   "rollbacks": checkpoints},
         "live_smoke": live,
         "final_test_evaluation": final,
         "pending": pending,
@@ -412,14 +459,32 @@ def format_markdown(report: Mapping) -> str:
     else:
         L.append(f"Not supplied: {reg['note']}.")
     L += ["", "### Admission (gate 6)", "", _sentence(sf["admission"]["note"]) + ".", "",
-          "### Rollbacks (gate 7)", "", _sentence(sf["rollbacks"]["note"]) + ".", ""]
+          "### Checkpoints and rollbacks (gate 7)", ""]
+    rb = sf["rollbacks"]
+    if rb["status"] == "supplied":
+        L += ["Checkpoints by status: " + (", ".join(f"{k} {v}" for k, v in
+                                                     rb["checkpoints"].items()) or "none")
+              + ". Log events: " + (", ".join(f"{k} {v}" for k, v in rb["events"].items())
+                                    or "none") + f". Rollbacks: {len(rb['rollbacks'])}."]
+        L += [f"- checkpoint {r['from']} rolled back to {r['to']}: {r['reason']}"
+              for r in rb["rollbacks"]]
+        L.append("")
+    else:
+        L += [_sentence(rb["note"]) + ".", ""]
 
     live = report["live_smoke"]
     L += ["## Live Hermes smoke run", ""]
     if live["status"] == "supplied":
         def num(v, f):
             return "n/a" if v is None else format(v, f)
-        L += [f"**{live['label']}.** Source: {live['source']}.", "",
+        L += [f"**{live['label']}.** {live['note']}", "",
+              f"Source: {live['source']}. Model: {live['model']}. Split: {live['split']}.",
+              "", "| Case | Completed | Quality (F1) | Est. cost USD | Latency s | Violation |",
+              "|---|---|---|---|---|---|"]
+        L += [f"| {c['case_id']} | {c['completed']} | {num(c['quality'], '.2f')} | "
+              f"{num(c['cost_usd'], '.4f')} | {num(c['latency_s'], '.1f')} | "
+              f"{c['violation']} |" for c in live["cases"]]
+        L += ["",
               f"- Completed: {live['completed']} / {live['n_cases']}; violations: "
               f"{live['violations']}.",
               f"- Mean quality {num(live['mean_quality'], '.3f')}, mean cost USD "
@@ -479,7 +544,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--verifier-seed", type=int, default=0)
     parser.add_argument("--verifier-resamples", type=int, default=1000)
     parser.add_argument("--registry", help="candidate registry SQLite file (read-only)")
-    parser.add_argument("--live-smoke", help="live Hermes smoke results JSON")
+    parser.add_argument("--checkpoints", help="gate 7 checkpoint store SQLite file (read-only)")
+    parser.add_argument("--live-smoke", default=str(DEFAULT_LIVE_SMOKE),
+                        help="live Hermes smoke results JSON ('' to omit)")
     parser.add_argument("--final-ledger", default=str(DEFAULT_LEDGER))
     parser.add_argument("--generated-at", help="timestamp to print (omitted by default "
                         "so the output is reproducible)")
@@ -490,7 +557,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                       benchmark_seed=args.benchmark_seed, resamples=args.resamples,
                       verifier_seed=args.verifier_seed,
                       verifier_bootstrap=args.verifier_resamples,
-                      registry_path=args.registry, live_smoke_path=args.live_smoke,
+                      registry_path=args.registry, checkpoint_path=args.checkpoints,
+                      live_smoke_path=args.live_smoke or None,
                       final_ledger_path=Path(args.final_ledger),
                       generated_at=args.generated_at)
     md, js = write_report(report, Path(args.out))

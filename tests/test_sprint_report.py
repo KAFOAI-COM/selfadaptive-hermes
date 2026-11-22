@@ -29,7 +29,12 @@ def test_report_is_labelled_synthetic(small_report):
     assert small_report["synthetic"] is True
     assert md.splitlines()[2].startswith("> **SYNTHETIC RESULTS.")
     assert "Nothing in this report is evidence that Hermes improves" in small_report["notice"]
-    assert small_report["headline"][-1].startswith("These are results from a hypothetical")
+    assert "results from a hypothetical simulator, not from Hermes" in small_report["headline"][-1]
+    bare = rp.generate(final_ledger_path=REPO / "does-not-exist.json", live_smoke_path=None,
+                       **SMALL)
+    assert bare["headline"][-1] == "These are results from a hypothetical simulator, not from Hermes."
+    assert bare["live_smoke"]["status"] == "pending"
+    assert "smoke" not in bare["notice"]
 
 
 def test_same_settings_reproduce_identical_output(small_report):
@@ -78,9 +83,12 @@ def test_safety_section_and_pending_gates(small_report):
     cv = safety["critical_violations"]
     assert cv["total_violations"] == sum(
         p[ph]["violations"] for p in cv["by_policy"].values() for ph in p)
-    assert safety["admission"]["status"] == safety["rollbacks"]["status"] == "pending"
-    assert safety["registry"]["status"] == "not supplied"
-    assert small_report["live_smoke"]["status"] == "pending"
+    assert safety["admission"]["status"] == "pending"
+    assert safety["rollbacks"]["status"] == safety["registry"]["status"] == "not supplied"
+    assert "0 rollbacks is not a safety result" in safety["rollbacks"]["note"]
+    live = small_report["live_smoke"]
+    assert live["label"] == "4 live cases; a smoke test, not a benchmark result"
+    assert "4-case Hermes smoke test" in small_report["notice"]
     assert small_report["final_test_evaluation"]["status"] == "not run"
 
 
@@ -97,6 +105,43 @@ def test_registry_rejections_are_reported(tmp_path):
     assert {(c["source"], c["status"], c["count"]) for c in summary["candidates"]} == {
         ("baseline", "admitted", 1), ("gepa", "rejected", 1)}
     assert summary["rejected"][0]["reason"] == "worse than baseline"
+
+
+def test_checkpoint_rollbacks_are_reported(tmp_path):
+    from evolution.adaptive.checkpoint import CheckpointStore
+    from evolution.adaptive.core import ContextualBandit
+    db = tmp_path / "knowledge.db"
+    policy = ContextualBandit(("a", "b"), epsilon=0.1, seed=1)
+    with CheckpointStore(db) as store:
+        good = store.save(policy, skill_version="skill/1", label="pre-admission")
+        policy.update("ctx", "a", 0.9)
+        cand = store.save(policy, skill_version="skill/2", label="post-admission",
+                          status="candidate")
+        store.rollback(policy, from_checkpoint_id=cand.checkpoint_id, reason="utility drop")
+    before = db.read_bytes()
+    section = rp.checkpoint_section(str(db))
+    assert db.read_bytes() == before   # opened read-only
+    assert section["checkpoints"] == {"good": 1, "rolled_back": 1}
+    assert section["events"]["rollback"] == 1
+    assert section["rollbacks"] == [{"to": good.checkpoint_id, "from": cand.checkpoint_id,
+                                     "reason": "utility drop"}]
+    md = rp.format_markdown(rp.generate(checkpoint_path=str(db),
+                                        final_ledger_path=REPO / "nope.json", **SMALL))
+    assert "Rollbacks: 1." in md and "rolled back to" in md
+
+
+def test_transcribed_smoke_results_match_the_sprint_doc():
+    """The live smoke JSON is a transcription of the merged sprint doc table."""
+    doc = (REPO / "docs/sprints/KAFO-EVO-001.md").read_text(encoding="utf-8")
+    data = json.loads(rp.DEFAULT_LIVE_SMOKE.read_text(encoding="utf-8"))
+    assert len(data["cases"]) == 4 and data["split"] == "validation"
+    for case in data["cases"]:
+        row = next(line for line in doc.splitlines() if line.startswith(f"| {case['case_id']} |"))
+        cells = [c.strip() for c in row.strip("|").split("|")]
+        assert cells[4] == f"{case['cost_usd']:.4f}"
+        assert cells[5] == f"{case['latency_s']:.1f}"
+        assert cells[6].split("/")[-1].strip() == f"{case['quality']:.2f}"
+        assert case["completed"] is True and case["violation"] is False
 
 
 def test_live_smoke_is_labelled_as_a_handful_of_cases(tmp_path):

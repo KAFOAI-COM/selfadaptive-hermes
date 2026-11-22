@@ -1,13 +1,14 @@
 # KAFO-EVO-001 sprint report
 
-> **SYNTHETIC RESULTS. The policy comparison uses a hypothetical simulator with invented success rates, costs and latencies; the verifier scores use reference reviews derived from the benchmark labels, not a model. Nothing in this report is evidence that Hermes improves on any real task.**
+> **SYNTHETIC RESULTS. The policy comparison uses a hypothetical simulator with invented success rates, costs and latencies; the verifier scores use reference reviews derived from the benchmark labels, not a model. Nothing in this report is evidence that Hermes improves on any real task. The only live data is a 4-case Hermes smoke test, reported separately as a plumbing check.**
 
 ## Headline findings
 
 - No adaptive policy shows an improvement over the best fixed strategy (`fixed:structured`) on held-out validation: epsilon_greedy -0.006 [-0.024, +0.014] (no improvement detected); linucb +0.012 [-0.009, +0.033] (no improvement detected).
 - On train, epsilon_greedy +0.025 [+0.007, +0.043]; linucb +0.041 [+0.026, +0.056] against `fixed:structured`. That baseline was chosen in hindsight on the same train data, so this does not show generalisation.
 - Every adaptive policy beats uniform random selection in both phases.
-- These are results from a hypothetical simulator, not from Hermes.
+- A live Hermes smoke run scored 4 validation cases (4 completed, 0 violations). With so few cases this is a plumbing check, not a quality estimate.
+- Apart from that smoke run, these are results from a hypothetical simulator, not from Hermes.
 
 ## Policy comparison (gate 4, synthetic simulator)
 
@@ -99,13 +100,25 @@ Not supplied: no candidate registry was given (--registry); counts below are unk
 
 Pending: gate 6 (candidate-vs-baseline admission) is not merged; no candidate has been admitted or rejected by an admission check.
 
-### Rollbacks (gate 7)
+### Checkpoints and rollbacks (gate 7)
 
-Pending: gate 7 (policy/skill checkpoint and rollback) is not merged; no rollback mechanism exists yet, so 0 rollbacks is not a safety result.
+No checkpoint store supplied (--checkpoints). The gate 7 rollback mechanism (checkpoint.admit_with_rollback) is merged, but no admission has run, so there is no rollback history: 0 rollbacks is not a safety result.
 
 ## Live Hermes smoke run
 
-No live Hermes smoke results supplied (--live-smoke); nothing in this report comes from a live Hermes run.
+**4 live cases; a smoke test, not a benchmark result.** Plumbing check, not evidence that Hermes improves or performs well. One run, no confidence intervals. Cost is Hermes' estimate at API rates; the provider bills a subscription, so metered spend may be zero.
+
+Source: live Hermes smoke run, 2026-11-22, owner-approved (PR #10); transcribed from docs/sprints/KAFO-EVO-001.md "Live smoke run", values rounded as published. Model: claude-sonnet-5-5[1m] via claude-subscription-directsdk-experimental, no toolsets. Split: validation.
+
+| Case | Completed | Quality (F1) | Est. cost USD | Latency s | Violation |
+|---|---|---|---|---|---|
+| pyrev-007 | True | 0.50 | 0.0041 | 4.3 | False |
+| pyrev-008 | True | 0.67 | 0.0045 | 3.7 | False |
+| pyrev-031 | True | 1.00 | 0.0014 | 3.7 | False |
+| pyrev-043 | True | 0.80 | 0.0063 | 5.2 | False |
+
+- Completed: 4 / 4; violations: 0.
+- Mean quality 0.743, mean cost USD 0.0041, mean latency s 4.2.
 
 ## Final test evaluation (one-time, recorded)
 
@@ -114,8 +127,7 @@ The one-time final test evaluation has not been run; when and on which reviewer 
 ## Pending
 
 - Pending: gate 6 (candidate-vs-baseline admission) is not merged; no candidate has been admitted or rejected by an admission check
-- Pending: gate 7 (policy/skill checkpoint and rollback) is not merged; no rollback mechanism exists yet, so 0 rollbacks is not a safety result
-- Live Hermes smoke run: no results supplied
+- Rollback history: none yet, because no admission has run
 - Final test evaluation: not run (owner decision)
 
 ## Reproduce
