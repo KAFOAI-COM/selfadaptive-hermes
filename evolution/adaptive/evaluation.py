@@ -22,7 +22,8 @@ re-validated by ``verifier.parse_case``.
 """
 from __future__ import annotations
 
-from typing import Mapping, Sequence
+from types import MappingProxyType
+from typing import Callable, Mapping, Sequence
 
 from . import benchmark, verifier
 
@@ -76,20 +77,40 @@ def evaluate_open(reviews: Mapping[str, Sequence], *,
             for split, cases in by_split.items()}
 
 
-def evaluate_sealed_test(reviews: Mapping[str, Sequence], *, final_evaluation: bool = False,
+def review_input(case) -> Mapping:
+    """What a reviewer may see of a case: no defects, labels or split."""
+    return MappingProxyType({
+        "case_id": case.case_id, "language": case.language, "code": case.code,
+        "context": MappingProxyType({"difficulty": case.difficulty, "domain": case.domain})})
+
+
+def evaluate_sealed_test(reviews: Mapping[str, Sequence] | None = None, *,
+                         reviewer: Callable[[Mapping], Sequence] | None = None,
+                         final_evaluation: bool = False,
                          version: str = benchmark.DEFAULT_VERSION,
                          **options) -> verifier.EvaluationReport:
     """Final, one-off evaluation on the sealed test split.
 
     Requires ``final_evaluation=True`` and refuses inside an optimisation
     phase. Its result must not feed back into optimisation or selection.
+    Pass exactly one of ``reviews`` (case_id -> findings) or ``reviewer``, a
+    callable that receives :func:`review_input` for each test case (code and
+    context only, never the labelled defects) and returns its findings. Use
+    ``evolution.adaptive.final_evaluation.run_final_evaluation`` for the
+    recorded, run-once final evaluation.
     """
     if final_evaluation is not True:
         raise benchmark.SealedSplitError(
             "evaluate_sealed_test needs final_evaluation=True; use evaluate_open "
             "during optimisation and selection")
+    if (reviews is None) == (reviewer is None):
+        raise ValueError("pass exactly one of reviews or reviewer")
+    if reviewer is not None and not callable(reviewer):
+        raise TypeError("reviewer must be callable")
     cases = tuple(to_verifier_case(c) for c in benchmark.load_split(
         "test", version=version, allow_sealed_test=True))
+    if reviewer is not None:
+        reviews = {c.case_id: reviewer(review_input(c)) for c in cases}
     unknown = sorted(set(reviews) - {c.case_id for c in cases})
     if unknown:
         raise ValueError(f"reviews for case_ids outside the test split: {unknown}")
