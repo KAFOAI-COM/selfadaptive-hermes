@@ -222,9 +222,8 @@ quality_fn = lambda item, outcome: quality(item.ground_truth, parse(outcome.outp
 ```
 
 `parse` (model output to findings) is not defined yet. Tests for these three
-plug-ins are in `tests/test_policy_compare.py`. The executor (#3) and verifier
-(#2) tests now run on the sprint branch; the gate 2 benchmark test is skipped
-until that module merges (it passed against the gate 2 files in a temp copy).
+plug-ins are in `tests/test_policy_compare.py`. All three (executor #3,
+verifier #2, gate 2 benchmark #4) now run on the sprint branch and pass.
 
 ### Synthetic result (2026-11-22)
 
