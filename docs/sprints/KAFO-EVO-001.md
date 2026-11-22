@@ -84,7 +84,11 @@ Hermes improves on any real task.**
 - [x] Verify upstream dependencies and run the complete repository test suite
       (185 passed, Python 3.12 + dspy 3.5.0; Python 3.14 has no dspy install here).
 - [ ] Implement a Hermes executor adapter using an actually supported API.
-- [ ] Build labelled Python-review benchmark with ground-truth defect IDs.
+- [x] Build labelled Python-review benchmark with ground-truth defect IDs.
+      (`datasets/python_review/v1`: 48 hand-written synthetic cases, 50 defects,
+      8 clean controls; train 28 / validation 10 / sealed test 10; SHA-256
+      manifest pinned in `evolution/adaptive/benchmark.py`. Labels are
+      single-author and not yet independently audited.)
 - [ ] Build independent verifier with reproducible precision/recall scoring.
 - [ ] Compare fixed, random, epsilon-greedy and LinUCB policies.
 - [ ] Preserve train / validation / sealed test separation.
