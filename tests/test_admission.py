@@ -231,35 +231,13 @@ def test_parse_findings():
 
 # ── Gate 5 registry review ───────────────────────────────────────────────────
 
-from types import SimpleNamespace  # noqa: E402
+import ast  # noqa: E402
+from pathlib import Path  # noqa: E402
 
+from evolution.adaptive import registry as reg  # noqa: E402
+
+REPO = Path(__file__).resolve().parents[1]
 BASE_STRATEGY = Strategy("reviewer")
-
-
-class FakeRegistry:
-    """Mirrors the gate 5 CandidateRegistry interface used by admission."""
-
-    def __init__(self):
-        self.entries, self.blobs, self.transitions = {}, {}, []
-
-    def add(self, cid, status, parent_id=None, skill="code-review", text="skill"):
-        self.entries[cid] = SimpleNamespace(candidate_id=cid, skill_name=skill,
-                                            parent_id=parent_id, status=status)
-        self.blobs[cid] = text.encode()
-
-    def get(self, cid):
-        return self.entries[cid]
-
-    def content(self, cid):
-        return self.blobs[cid]
-
-    def transition(self, cid, to_status, *, reason, decided_by, evidence):
-        allowed = {"proposed": {"admitted", "rejected"}}
-        assert to_status in allowed.get(self.entries[cid].status, set())
-        assert reason and decided_by and (evidence or to_status != "admitted")
-        json.dumps(evidence, allow_nan=False)
-        self.entries[cid].status = to_status
-        self.transitions.append((cid, to_status, reason, decided_by, evidence))
 
 
 def registry_factory(validation, cand_id, base_id, cand_spec, base_spec="[]"):
@@ -275,64 +253,143 @@ def registry_factory(validation, cand_id, base_id, cand_spec, base_spec="[]"):
 
 
 @pytest.fixture
-def registry():
-    reg = FakeRegistry()
-    reg.add("code-review@base", "admitted", text="baseline skill")
-    reg.add("code-review@cand", "proposed", parent_id="code-review@base", text="evolved skill")
-    return reg
+def registry(tmp_path):
+    with reg.CandidateRegistry(tmp_path / "registry.db") as r:
+        yield r
 
 
-def test_review_is_a_dry_run_by_default(validation, registry):
-    d = adm.review_registered(registry, "code-review@cand", base=BASE_STRATEGY,
-                              make_executor=registry_factory(
-                                  validation, "code-review@cand", "code-review@base", _truth))
-    assert d.admitted and d.baseline_id == "code-review@base"
-    assert registry.transitions == [] and registry.get("code-review@cand").status == "proposed"
+@pytest.fixture
+def pair(registry):
+    base = registry.register_baseline("code-review", b"baseline skill\n")
+    cand = registry.propose("code-review", b"evolved skill\n", parent_id=base.candidate_id,
+                            provenance={"gepa_score": 0.99})   # never read by admission
+    return base, cand
+
+
+def _review(registry, validation, pair, better=True, apply=True):
+    base, cand = pair
+    make = registry_factory(validation, cand.candidate_id, base.candidate_id,
+                            _truth if better else "[]")
+    return adm.review_registered(registry, cand.candidate_id, base=BASE_STRATEGY,
+                                 make_executor=make, apply=apply)
+
+
+def test_review_is_a_dry_run_by_default(registry, validation, pair):
+    d = _review(registry, validation, pair, apply=False)
+    assert d.admitted and d.baseline_id == pair[0].candidate_id
+    assert registry.get(pair[1].candidate_id).status == reg.PROPOSED
+    assert [t.to_status for t in registry.history(pair[1].candidate_id)] == [reg.PROPOSED]
 
 
 @pytest.mark.parametrize("better", [True, False])
-def test_review_applies_admission_or_rejection_with_evidence(validation, registry, better):
-    make = registry_factory(validation, "code-review@cand", "code-review@base",
-                            _truth if better else "[]")
-    d = adm.review_registered(registry, "code-review@cand", base=BASE_STRATEGY,
-                              make_executor=make, apply=True)
-    ((cid, status, reason, decided_by, evidence),) = registry.transitions
-    assert status == ("admitted" if better else "rejected") and d.admitted is better
-    assert decided_by == f"admission-gate:{PINNED_POLICY_SHA256[:12]}"
-    assert evidence["policy_sha256"] == PINNED_POLICY_SHA256 and evidence["synthetic"] is True
-    assert better or "margin_not_met" in reason
-
-
-def test_evaluation_arm_takes_tools_from_base_only(registry):
-    arm = adm.evaluation_arm(registry, "code-review@cand", BASE_STRATEGY)
-    assert arm.strategy.system_prompt == "evolved skill"
-    assert arm.strategy.toolsets == BASE_STRATEGY.toolsets
-    assert arm.strategy.strategy_id == "reviewer:code-review@cand"
-
-
-def test_review_refuses_wrong_states(validation, registry):
-    make = registry_factory(validation, "code-review@cand", "code-review@base", "[]")
-    registry.add("code-review@orphan", "proposed")
-    registry.add("other@cand", "proposed", parent_id="code-review@base", skill="other")
-    for cid in ("code-review@base", "code-review@orphan", "other@cand"):
+def test_review_records_admission_or_rejection_with_evidence(registry, validation, pair, better):
+    d = _review(registry, validation, pair, better=better)
+    last = registry.history(pair[1].candidate_id)[-1]
+    assert last.to_status == (reg.ADMITTED if better else reg.REJECTED) and d.admitted is better
+    assert last.decided_by == f"admission-gate:{PINNED_POLICY_SHA256[:12]}"
+    assert last.evidence["policy_sha256"] == PINNED_POLICY_SHA256
+    assert last.evidence["synthetic"] is True
+    assert better or "margin_not_met" in last.reason
+    if not better:   # rejection is terminal in gate 5
         with pytest.raises(ValueError):
-            adm.review_registered(registry, cid, base=BASE_STRATEGY, make_executor=make)
-    registry.entries["code-review@base"].status = "retired"
+            _review(registry, validation, pair)
+
+
+def test_gate_admitted_candidate_enters_the_catalogue(registry, validation, pair):
+    _review(registry, validation, pair)
+    assert adm.admission_evidence_errors(registry, pair[1].candidate_id) == []
+    prompts = [s.system_prompt for s in adm.admitted_catalogue(registry, "code-review",
+                                                               BASE_STRATEGY)]
+    assert prompts == ["baseline skill\n", "evolved skill\n"]
+
+
+def test_admission_that_bypassed_the_gate_is_refused_by_the_catalogue(registry, pair):
+    registry.transition(pair[1].candidate_id, reg.ADMITTED, reason="looks good",
+                        decided_by="someone", evidence={"gepa_score": 0.99})
+    errors = adm.admission_evidence_errors(registry, pair[1].candidate_id)
+    assert errors and any("accepted admission policy" in e for e in errors)
+    with pytest.raises(adm.AdmissionEvidenceError):
+        adm.admitted_catalogue(registry, "code-review", BASE_STRATEGY)
+
+
+def _forged(registry, validation, pair, **changes):
+    """Evidence copied from a real passing decision for this pair, then edited."""
+    base, cand = pair
+    decision = adm.admit(adm.evaluation_arm(registry, cand.candidate_id, BASE_STRATEGY),
+                         adm.evaluation_arm(registry, base.candidate_id, BASE_STRATEGY),
+                         registry_factory(validation, cand.candidate_id,
+                                          base.candidate_id, _truth))
+    evidence = {**decision.to_dict(), **changes.pop("evidence", {})}
+    registry.transition(cand.candidate_id, reg.ADMITTED, reason="forged",
+                        decided_by=changes.pop("decided_by",
+                                               f"admission-gate:{PINNED_POLICY_SHA256[:12]}"),
+                        evidence=evidence)
+    return adm.admission_evidence_errors(registry, cand.candidate_id)
+
+
+@pytest.mark.parametrize("changes, expected", [
+    ({}, None),   # a genuine decision recorded by hand is accepted
+    ({"decided_by": "someone"}, "not the admission gate"),
+    ({"evidence": {"candidate_id": "code-review@000000000000"}}, "different candidate"),
+    ({"evidence": {"admitted": False}}, "not an admission decision"),
+    ({"evidence": {"candidate_violations": 2}}, "violations"),
+    ({"evidence": {"ci_low": -0.1}}, "margin and CI"),
+    ({"evidence": {"policy": {**ADMISSION_POLICY.to_dict(), "min_margin": 0.0001}}},
+     "does not match"),
+])
+def test_forged_or_edited_evidence_is_detected(registry, validation, pair, changes, expected):
+    errors = _forged(registry, validation, pair, **changes)
+    if expected is None:
+        assert errors == []
+    else:
+        assert any(expected in e for e in errors), errors
+
+
+def test_evaluation_arm_takes_tools_from_base_only(registry, pair):
+    base = Strategy("reviewer", system_prompt="ignored", toolsets=("todo",))
+    arm = adm.evaluation_arm(registry, pair[1].candidate_id, base)
+    assert arm.strategy.system_prompt == "evolved skill\n"
+    assert arm.strategy.toolsets == ("todo",)
+    assert arm.strategy.strategy_id == f"reviewer:{pair[1].candidate_id}"
+
+
+def test_review_refuses_wrong_states(registry, validation, pair):
+    base, cand = pair
+    make = registry_factory(validation, cand.candidate_id, base.candidate_id, "[]")
+    with pytest.raises(ValueError, match="only proposed"):
+        adm.review_registered(registry, base.candidate_id, base=BASE_STRATEGY,
+                              make_executor=make)
+    registry.transition(base.candidate_id, reg.RETIRED, reason="superseded",
+                        decided_by="test", evidence={})
     with pytest.raises(ValueError, match="not admitted"):
-        adm.review_registered(registry, "code-review@cand", base=BASE_STRATEGY,
+        adm.review_registered(registry, cand.candidate_id, base=BASE_STRATEGY,
                               make_executor=make)
 
 
-def test_real_gate5_registry_when_available(validation, tmp_path):
-    reg_mod = pytest.importorskip("evolution.adaptive.registry")
-    with reg_mod.CandidateRegistry(tmp_path / "registry.db") as reg:
-        base = reg.register_baseline("code-review", b"baseline skill\n")
-        cand = reg.propose("code-review", b"evolved skill\n", parent_id=base.candidate_id)
-        make = registry_factory(validation, cand.candidate_id, base.candidate_id, _truth)
-        d = adm.review_registered(reg, cand.candidate_id, base=BASE_STRATEGY,
-                                  make_executor=make, apply=True)
-        assert d.admitted and reg.get(cand.candidate_id).status == reg_mod.ADMITTED
-        (last,) = reg.history(cand.candidate_id)[-1:]
-        assert last.evidence["policy_sha256"] == PINNED_POLICY_SHA256
-        assert reg_mod.candidate_strategy(reg, cand.candidate_id, BASE_STRATEGY).system_prompt \
-            == "evolved skill\n"
+def _transition_calls(root: Path) -> list[str]:
+    found = []
+    for path in sorted((root / "evolution").rglob("*.py")):
+        rel = path.relative_to(root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        owner = {}
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for child in ast.walk(fn):
+                    owner.setdefault(id(child), fn.name)
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "transition"):
+                found.append(f"{rel}:{owner.get(id(node))}")
+    return found
+
+
+def test_only_the_admission_gate_changes_candidate_status():
+    assert _transition_calls(REPO) == ["evolution/adaptive/admission.py:review_registered"]
+
+
+def test_transition_scan_catches_other_callers(tmp_path):
+    sneaky = tmp_path / "evolution" / "adaptive" / "sneaky.py"
+    sneaky.parent.mkdir(parents=True)
+    sneaky.write_text("def promote(r, cid):\n    r.transition(cid, 'admitted', reason='x',"
+                      " decided_by='x', evidence={'ok': 1})\n", encoding="utf-8")
+    assert _transition_calls(tmp_path) == ["evolution/adaptive/sneaky.py:promote"]

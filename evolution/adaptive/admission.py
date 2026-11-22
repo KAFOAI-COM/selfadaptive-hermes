@@ -41,7 +41,7 @@ import logging
 import statistics
 from typing import Callable, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
-from . import evaluation, verifier
+from . import evaluation, registry as reg, verifier
 from .benchmark import DEFAULT_VERSION, DEFECT_CATEGORIES, OPEN_SPLITS, optimisation_phase
 from .compare import bootstrap_ci
 from .core import Reward, score_outcome
@@ -291,17 +291,26 @@ def _admit(candidate, baseline, make_executor, policy: AdmissionPolicy) -> Admis
 
 
 # ── Gate 5 registry ──────────────────────────────────────────────────────────
-# Coded against the gate 5 ``CandidateRegistry`` interface (``get``, ``content``,
-# ``transition``; statuses ``proposed`` / ``admitted`` / ``rejected``) without
-# importing it, so this module does not depend on unmerged code.
 
-PROPOSED, ADMITTED, REJECTED = "proposed", "admitted", "rejected"
+# Policy fingerprints whose decisions are accepted as admission evidence. Add a
+# superseded policy here (in reviewed code) when ADMISSION_POLICY changes, so
+# candidates admitted under it stay valid.
+ACCEPTED_POLICY_SHA256 = frozenset({ADMISSION_POLICY.fingerprint()})
 
 
-def evaluation_arm(registry, candidate_id: str, base: Strategy) -> ArmSpec:
+class AdmissionEvidenceError(reg.RegistryError):
+    """An admitted candidate lacks a valid gate 6 admission decision."""
+
+
+def _decided_by(policy_sha256: str) -> str:
+    return f"admission-gate:{policy_sha256[:12]}"
+
+
+def evaluation_arm(registry: reg.CandidateRegistry, candidate_id: str,
+                   base: Strategy) -> ArmSpec:
     """Arm for a registry entry, for evaluation only.
 
-    Same rule as gate 5 ``candidate_strategy``: the skill text becomes the
+    Same rule as ``registry.candidate_strategy``: the skill text becomes the
     system prompt and toolsets come from ``base``, so a candidate cannot change
     tools. Unlike ``candidate_strategy`` it accepts a ``proposed`` candidate,
     because admission must run it before it is admitted.
@@ -315,24 +324,25 @@ def evaluation_arm(registry, candidate_id: str, base: Strategy) -> ArmSpec:
                             system_prompt=text, toolsets=base.toolsets))
 
 
-def review_registered(registry, candidate_id: str, *, base: Strategy,
-                      make_executor: Callable[[int], Executor],
+def review_registered(registry: reg.CandidateRegistry, candidate_id: str, *,
+                      base: Strategy, make_executor: Callable[[int], Executor],
                       apply: bool = False) -> AdmissionDecision:
     """Admission review of a proposed registry candidate against its parent.
 
     The baseline is the candidate's ``parent_id``, which must be admitted.
-    Dry run by default; with ``apply=True`` the decision is recorded through
-    ``registry.transition`` as ``admitted`` or ``rejected`` (terminal in gate 5),
-    with the full decision as evidence.
+    Provenance (GEPA's self-reported scores) is never read. Dry run by default;
+    with ``apply=True`` the decision is recorded through ``registry.transition``
+    as ``admitted`` or ``rejected`` (terminal), with the full decision as
+    evidence. This is the only package code allowed to call ``transition``.
     """
     entry = registry.get(candidate_id)
-    if entry.status != PROPOSED:
+    if entry.status != reg.PROPOSED:
         raise ValueError(f"{candidate_id} is {entry.status}; only proposed candidates "
                          "are reviewed")
     if not entry.parent_id:
         raise ValueError(f"{candidate_id} has no parent baseline")
     parent = registry.get(entry.parent_id)
-    if parent.status != ADMITTED:
+    if parent.status != reg.ADMITTED:
         raise ValueError(f"baseline {parent.candidate_id} is {parent.status}, not admitted")
     if parent.skill_name != entry.skill_name:
         raise ValueError("candidate and baseline must be the same skill")
@@ -340,9 +350,61 @@ def review_registered(registry, candidate_id: str, *, base: Strategy,
                      evaluation_arm(registry, parent.candidate_id, base), make_executor)
     if apply:
         registry.transition(
-            candidate_id, ADMITTED if decision.admitted else REJECTED,
+            candidate_id, reg.ADMITTED if decision.admitted else reg.REJECTED,
             reason=("passed candidate-vs-baseline validation" if decision.admitted
                     else "; ".join(decision.reasons)),
-            decided_by=f"admission-gate:{decision.policy_sha256[:12]}",
+            decided_by=_decided_by(decision.policy_sha256),
             evidence=decision.to_dict())
     return decision
+
+
+def admission_evidence_errors(registry: reg.CandidateRegistry, candidate_id: str) -> list[str]:
+    """Why an admitted candidate's admission is not a valid gate 6 decision ([] if valid).
+
+    Baselines (entered admitted by ``register_baseline``) need no admission.
+    """
+    entry = registry.get(candidate_id)
+    if entry.status != reg.ADMITTED:
+        return [f"{candidate_id} is {entry.status}, not admitted"]
+    if entry.source == reg.BASELINE:
+        return []
+    admissions = [t for t in registry.history(candidate_id) if t.to_status == reg.ADMITTED]
+    if len(admissions) != 1:
+        return [f"expected one admission record, found {len(admissions)}"]
+    record, ev = admissions[0], dict(admissions[0].evidence)
+    errors = []
+    sha = ev.get("policy_sha256")
+    if sha not in ACCEPTED_POLICY_SHA256:
+        errors.append("evidence policy_sha256 is not an accepted admission policy")
+    elif record.decided_by != _decided_by(sha):
+        errors.append(f"decided_by {record.decided_by!r} is not the admission gate")
+    try:
+        policy_ok = AdmissionPolicy(**{**ev.get("policy", {}),
+                                       "seeds": tuple(ev.get("policy", {}).get("seeds", ()))}
+                                    ).fingerprint() == sha
+    except (TypeError, ValueError):
+        policy_ok = False
+    if not policy_ok:
+        errors.append("evidence policy does not match its policy_sha256")
+    if ev.get("admitted") is not True or ev.get("reasons"):
+        errors.append("evidence is not an admission decision")
+    if ev.get("candidate_id") != candidate_id or ev.get("baseline_id") != entry.parent_id:
+        errors.append("evidence is for a different candidate or baseline")
+    if ev.get("candidate_violations") != 0:
+        errors.append("evidence records candidate violations")
+    gain, low = ev.get("mean_utility_gain"), ev.get("ci_low")
+    margin = ev.get("policy", {}).get("min_margin")
+    if not (isinstance(gain, (int, float)) and isinstance(low, (int, float))
+            and isinstance(margin, (int, float)) and gain >= margin and low > 0):
+        errors.append("evidence does not meet the admission margin and CI rules")
+    return errors
+
+
+def admitted_catalogue(registry: reg.CandidateRegistry, skill_name: str,
+                       base: Strategy) -> tuple[Strategy, ...]:
+    """``registry.admitted_strategies``, refusing any admission not made by this gate."""
+    for entry in registry.candidates(skill_name=skill_name, status=reg.ADMITTED):
+        errors = admission_evidence_errors(registry, entry.candidate_id)
+        if errors:
+            raise AdmissionEvidenceError(f"{entry.candidate_id}: " + "; ".join(errors))
+    return reg.admitted_strategies(registry, skill_name, base)
