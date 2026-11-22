@@ -5,7 +5,7 @@ on:
   push:
     branches:
       - main
-      - "sprint/**"
+      - sprint/kafo-evo-001-adaptive-loop
 
 permissions:
   contents: read
