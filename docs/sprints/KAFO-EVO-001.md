@@ -144,6 +144,12 @@ Hermes improves on any real task.**
       decision (`decided_by`, margin, CI, violations). Limit: these checks validate
       the evidence, not who wrote it, so a person with direct registry or database
       access could still copy a genuine decision.
+      With gate 7: `tests/test_admission_rollback.py` passes `review_registered
+      (apply=True)` as the `admit` step of `checkpoint.admit_with_rollback` (a real
+      registry and checkpoint store, FakeExecutor). Admit then keep, gate 6 rejection
+      (policy restored, candidate `rejected`) and gate 7 rollback all work, and the
+      sealed split stays closed throughout. Open: after a gate 7 rollback the
+      candidate stays `admitted` in the registry, because nothing yet retires it.
 - [x] Implement policy/skill checkpoint and rollback.
       (`evolution/adaptive/checkpoint.py`, PR #9; 45 offline tests, full suite
       475 passed on GitHub Actions. See "Checkpoint and rollback (gate 7)".
