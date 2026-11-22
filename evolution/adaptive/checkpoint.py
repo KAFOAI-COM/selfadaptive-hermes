@@ -379,6 +379,11 @@ _SCHEMA = (
 )
 
 
+# Written only by the store itself; callers cannot forge them via record_event.
+_RESERVED_EVENTS = ("save", "restore", "promote", "rollback", "corruption_detected",
+                    "mismatch_skipped")
+
+
 def policy_line(kind: str, policy_version: str) -> str:
     """Key of the checkpoint history a policy belongs to."""
     return canonical_json([kind, policy_version])
@@ -525,6 +530,17 @@ class CheckpointStore:
     def active_id(self, policy) -> Optional[int]:
         """Active checkpoint on ``policy``'s line, or None."""
         return self._active(policy_line(_codec(policy)[0], policy.version))
+
+    def record_event(self, event: str, *, reason: str, checkpoint_id: Optional[int] = None,
+                     from_checkpoint_id: Optional[int] = None,
+                     details: Mapping = ()) -> None:
+        """Append one row to the checkpoint log (its own transaction)."""
+        if not isinstance(event, str) or not event or event in _RESERVED_EVENTS:
+            raise ValueError(f"event must be a nonempty string, not one of {_RESERVED_EVENTS}")
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("reason must be a nonempty string")
+        with self._transaction():
+            self._log(event, checkpoint_id, from_checkpoint_id, reason, dict(details))
 
     def log(self) -> list[dict]:
         cur = self.conn.execute(
