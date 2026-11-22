@@ -83,7 +83,9 @@ def test_safety_section_and_pending_gates(small_report):
     cv = safety["critical_violations"]
     assert cv["total_violations"] == sum(
         p[ph]["violations"] for p in cv["by_policy"].values() for ph in p)
-    assert safety["admission"]["status"] == "pending"
+    from evolution.adaptive.admission import ADMISSION_POLICY
+    assert safety["admission"]["status"] == "merged"
+    assert safety["admission"]["policy_sha256"] == ADMISSION_POLICY.fingerprint()
     assert safety["rollbacks"]["status"] == safety["registry"]["status"] == "not supplied"
     assert "0 rollbacks is not a safety result" in safety["rollbacks"]["note"]
     live = small_report["live_smoke"]

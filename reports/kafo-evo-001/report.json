@@ -61,7 +61,7 @@
   },
   "notice": "SYNTHETIC RESULTS. The policy comparison uses a hypothetical simulator with invented success rates, costs and latencies; the verifier scores use reference reviews derived from the benchmark labels, not a model. Nothing in this report is evidence that Hermes improves on any real task. The only live data is a 4-case Hermes smoke test, reported separately as a plumbing check.",
   "pending": [
-    "pending: gate 6 (candidate-vs-baseline admission) is not merged; no candidate has been admitted or rejected by an admission check",
+    "admission and rejection history: no candidate registry supplied; no admission review has been run outside the test suite",
     "rollback history: none yet, because no admission has run",
     "final test evaluation: not run (owner decision)"
   ],
@@ -777,8 +777,30 @@
   },
   "safety": {
     "admission": {
-      "note": "pending: gate 6 (candidate-vs-baseline admission) is not merged; no candidate has been admitted or rejected by an admission check",
-      "status": "pending"
+      "note": "decisions are recorded in the candidate registry; supply it with --registry to report admitted and rejected candidates",
+      "policy": {
+        "benchmark_version": "v1",
+        "bootstrap_seed": 0,
+        "confidence": 0.95,
+        "max_critical_violations": 0,
+        "min_margin": 0.05,
+        "n_bootstrap": 2000,
+        "reference_cost_usd": 0.03,
+        "reference_latency_s": 6.0,
+        "seeds": [
+          0,
+          1,
+          2
+        ],
+        "split": "validation"
+      },
+      "policy_sha256": "1c3cd3e28dd5f9d140183bae6a747b7b0f396358adb93d14eeceff6913f0f4ed",
+      "rules": [
+        "zero critical violations for the candidate over all runs",
+        "mean utility gain over the baseline of at least 0.05",
+        "lower bound of the 95% paired bootstrap CI of that gain above 0"
+      ],
+      "status": "merged"
     },
     "critical_violations": {
       "by_policy": {
@@ -847,11 +869,11 @@
       "total_violations": 474
     },
     "registry": {
-      "note": "no candidate registry was given (--registry); counts below are unknown, not zero",
+      "note": "no candidate registry was given (--registry); candidate counts are unknown, not zero",
       "status": "not supplied"
     },
     "rollbacks": {
-      "note": "no checkpoint store supplied (--checkpoints). The gate 7 rollback mechanism (checkpoint.admit_with_rollback) is merged, but no admission has run, so there is no rollback history: 0 rollbacks is not a safety result",
+      "note": "no checkpoint store supplied (--checkpoints). Gate 6 admission and the gate 7 rollback on the admission path (admission.review_with_rollback) are merged, but no admission review has been run outside the test suite, so there is no rollback history: 0 rollbacks is not a safety result",
       "status": "not supplied"
     },
     "sealed_access_blocked_during_generation": 0

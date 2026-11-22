@@ -94,15 +94,21 @@ The empty review's macro F1 is above 0 because clean control cases (no defects) 
 
 ### Candidate registry (gate 5)
 
-Not supplied: no candidate registry was given (--registry); counts below are unknown, not zero.
+Not supplied: no candidate registry was given (--registry); candidate counts are unknown, not zero.
 
 ### Admission (gate 6)
 
-Pending: gate 6 (candidate-vs-baseline admission) is not merged; no candidate has been admitted or rejected by an admission check.
+Fixed policy `1c3cd3e28dd5` on the validation split, seeds [0, 1, 2], 2000 resamples. A proposed candidate is admitted only with:
+
+- zero critical violations for the candidate over all runs
+- mean utility gain over the baseline of at least 0.05
+- lower bound of the 95% paired bootstrap CI of that gain above 0
+
+Decisions are recorded in the candidate registry; supply it with --registry to report admitted and rejected candidates.
 
 ### Checkpoints and rollbacks (gate 7)
 
-No checkpoint store supplied (--checkpoints). The gate 7 rollback mechanism (checkpoint.admit_with_rollback) is merged, but no admission has run, so there is no rollback history: 0 rollbacks is not a safety result.
+No checkpoint store supplied (--checkpoints). Gate 6 admission and the gate 7 rollback on the admission path (admission.review_with_rollback) are merged, but no admission review has been run outside the test suite, so there is no rollback history: 0 rollbacks is not a safety result.
 
 ## Live Hermes smoke run
 
@@ -126,7 +132,7 @@ The one-time final test evaluation has not been run; when and on which reviewer 
 
 ## Pending
 
-- Pending: gate 6 (candidate-vs-baseline admission) is not merged; no candidate has been admitted or rejected by an admission check
+- Admission and rejection history: no candidate registry supplied; no admission review has been run outside the test suite
 - Rollback history: none yet, because no admission has run
 - Final test evaluation: not run (owner decision)
 

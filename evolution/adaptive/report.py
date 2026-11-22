@@ -37,7 +37,7 @@ import sqlite3
 import sys
 from typing import Mapping, Optional, Sequence
 
-from . import benchmark, compare, evaluation, synthetic, verifier
+from . import admission, benchmark, compare, evaluation, synthetic, verifier
 from .benchmark import optimisation_phase, sealed_access_attempts
 
 SCHEMA = "kafo-sprint-report/1"
@@ -48,12 +48,11 @@ NOTICE = ("SYNTHETIC RESULTS. The policy comparison uses a hypothetical simulato
           "invented success rates, costs and latencies; the verifier scores use reference "
           "reviews derived from the benchmark labels, not a model. Nothing in this report "
           "is evidence that Hermes improves on any real task.")
-PENDING_ADMISSION = ("pending: gate 6 (candidate-vs-baseline admission) is not merged; "
-                     "no candidate has been admitted or rejected by an admission check")
-NO_CHECKPOINT_STORE = ("no checkpoint store supplied (--checkpoints). The gate 7 rollback "
-                       "mechanism (checkpoint.admit_with_rollback) is merged, but no admission "
-                       "has run, so there is no rollback history: 0 rollbacks is not a safety "
-                       "result")
+NO_CHECKPOINT_STORE = ("no checkpoint store supplied (--checkpoints). Gate 6 admission and "
+                       "the gate 7 rollback on the admission path "
+                       "(admission.review_with_rollback) are merged, but no admission review "
+                       "has been run outside the test suite, so there is no rollback history: "
+                       "0 rollbacks is not a safety result")
 DEFAULT_LIVE_SMOKE = DEFAULT_OUT / "live_smoke_2026-11-22.json"
 NOISY_KEEP, NOISY_FALSE_ALARM = 0.7, 0.25
 
@@ -180,7 +179,7 @@ def _with_live(lines: list[str], live: Mapping) -> list[str]:
 def _registry_summary(path: Optional[str]) -> dict:
     if path is None:
         return {"status": "not supplied", "note": "no candidate registry was given "
-                "(--registry); counts below are unknown, not zero"}
+                "(--registry); candidate counts are unknown, not zero"}
     uri = Path(path).resolve().as_uri() + "?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     try:
@@ -197,6 +196,19 @@ def _registry_summary(path: Optional[str]) -> dict:
                          for m in moves if m[2] == "rejected"],
             "retired": [dict(zip(("candidate_id", "from", "to", "reason", "decided_by"), m))
                         for m in moves if m[2] == "retired"]}
+
+
+def admission_section() -> dict:
+    """The fixed gate 6 admission policy (thresholds are code, not arguments)."""
+    policy = admission.ADMISSION_POLICY
+    return {"status": "merged", "policy": policy.to_dict(),
+            "policy_sha256": policy.fingerprint(),
+            "rules": [f"zero critical violations for the candidate over all runs",
+                      f"mean utility gain over the baseline of at least {policy.min_margin}",
+                      f"lower bound of the {int(policy.confidence * 100)}% paired bootstrap "
+                      "CI of that gain above 0"],
+            "note": "decisions are recorded in the candidate registry; supply it with "
+                    "--registry to report admitted and rejected candidates"}
 
 
 def checkpoint_section(path: Optional[str]) -> dict:
@@ -303,7 +315,10 @@ def generate(*, seeds: int = 20, train_episodes: int = 300, benchmark_seed: int 
         blocked = sealed_access_attempts() - attempts_before
     total_steps = sum(c["steps"] for p in violations.values() for c in p.values())
     total_viol = sum(c["violations"] for p in violations.values() for c in p.values())
-    pending = [PENDING_ADMISSION]
+    pending = []
+    if registry["status"] == "not supplied":
+        pending.append("admission and rejection history: no candidate registry supplied; "
+                       "no admission review has been run outside the test suite")
     if checkpoints["status"] == "not supplied":
         pending.append("rollback history: none yet, because no admission has run")
     if live["status"] == "pending":
@@ -337,7 +352,7 @@ def generate(*, seeds: int = 20, train_episodes: int = 300, benchmark_seed: int 
                                            "by_policy": violations},
                    "sealed_access_blocked_during_generation": blocked,
                    "registry": registry,
-                   "admission": {"status": "pending", "note": PENDING_ADMISSION},
+                   "admission": admission_section(),
                    "rollbacks": checkpoints},
         "live_smoke": live,
         "final_test_evaluation": final,
@@ -458,7 +473,13 @@ def format_markdown(report: Mapping) -> str:
               f"{m['reason']}" for m in reg["rejected"] + reg["retired"]]
     else:
         L.append(f"Not supplied: {reg['note']}.")
-    L += ["", "### Admission (gate 6)", "", _sentence(sf["admission"]["note"]) + ".", "",
+    adm = sf["admission"]
+    L += ["", "### Admission (gate 6)", "",
+          f"Fixed policy `{adm['policy_sha256'][:12]}` on the {adm['policy']['split']} split, "
+          f"seeds {adm['policy']['seeds']}, {adm['policy']['n_bootstrap']} resamples. A "
+          "proposed candidate is admitted only with:", ""]
+    L += [f"- {r}" for r in adm["rules"]]
+    L += ["", _sentence(adm["note"]) + ".", "",
           "### Checkpoints and rollbacks (gate 7)", ""]
     rb = sf["rollbacks"]
     if rb["status"] == "supplied":
