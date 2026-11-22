@@ -1,14 +1,17 @@
 # KAFO-EVO-001 sprint report
 
-> **SYNTHETIC RESULTS. The policy comparison uses a hypothetical simulator with invented success rates, costs and latencies; the verifier scores use reference reviews derived from the benchmark labels, not a model. Nothing in this report is evidence that Hermes improves on any real task. The only live data is a 4-case Hermes smoke test, reported separately as a plumbing check.**
+> **SYNTHETIC RESULTS. The simulator sections (gate 4 policy comparison, simulated cost and latency) use a hypothetical simulator with invented success rates, costs and latencies; the verifier reference scores use reviews derived from the benchmark labels, not a model. The live full run (live-1), the one-time sealed final evaluation and a 4-case smoke test used live Hermes (claude-sonnet-5-5[1m]) on the hand-written, synthetic python_review benchmark. Nothing in this report is evidence that Hermes improves on any real task: no result here is evidence of real-world improvement.**
 
 ## Headline findings
 
-- No adaptive policy shows an improvement over the best fixed strategy (`fixed:structured`) on held-out validation: epsilon_greedy -0.006 [-0.024, +0.014] (no improvement detected); linucb +0.012 [-0.009, +0.033] (no improvement detected).
+- Pre-registered sealed final evaluation (run once, live Hermes, 10 hand-written synthetic test cases): candidate `github-code-review@28dcec5ab528` minus baseline `github-code-review@11ad06e6d49b`, STRICT micro-F1 +0.302 [0.157, 0.462] (primary; CI lower bound above 0, so the pre-registered rule is met), mostly precision (precision +0.446 [0.260, 0.600], recall +0.111 [0.000, 0.375]); LENIENT micro-F1 +0.332 [0.194, 0.474] (secondary).
+- Live full run live-1 (2-arm comparison on live Hermes outcomes, validation split): the best fixed strategy `fixed:skill` has utility 0.607; no adaptive policy improves on it: epsilon_greedy -0.032 [-0.039, -0.024] (worse); linucb -0.034 [-0.041, -0.026] (worse).
+- GEPA candidate `github-code-review@28dcec5ab528` (parent `github-code-review@11ad06e6d49b`) was admitted by gate 6 with a validation utility gain of +0.127 [+0.006, +0.272]; gate 7's post-admission check then kept it (catalogue validation utility 0.617 -> 0.809).
+- Simulator: No adaptive policy shows an improvement over the best fixed strategy (`fixed:structured`) on held-out validation: epsilon_greedy -0.006 [-0.024, +0.014] (no improvement detected); linucb +0.012 [-0.009, +0.033] (no improvement detected).
 - On train, epsilon_greedy +0.025 [+0.007, +0.043]; linucb +0.041 [+0.026, +0.056] against `fixed:structured`. That baseline was chosen in hindsight on the same train data, so this does not show generalisation.
 - Every adaptive policy beats uniform random selection in both phases.
 - A live Hermes smoke run scored 4 validation cases (4 completed, 0 violations). With so few cases this is a plumbing check, not a quality estimate.
-- Apart from that smoke run, these are results from a hypothetical simulator, not from Hermes.
+- The simulator findings are results from a hypothetical simulator, not from Hermes. The live full run (live-1), the one-time sealed final evaluation and a 4-case smoke test used live Hermes on a hand-written, synthetic benchmark, so none of this is evidence of real-world improvement.
 
 ## Policy comparison (gate 4, synthetic simulator)
 
@@ -94,7 +97,19 @@ The empty review's macro F1 is above 0 because clean control cases (no defects) 
 
 ### Candidate registry (gate 5)
 
-Not supplied: no candidate registry was given (--registry); candidate counts are unknown, not zero.
+| Source | Status | Candidates |
+|---|---|---|
+| baseline | admitted | 1 |
+| gepa | admitted | 1 |
+
+| Candidate | Parent | Source | Status |
+|---|---|---|---|
+| `github-code-review@11ad06e6d49b` | - | baseline | admitted |
+| `github-code-review@28dcec5ab528` | `github-code-review@11ad06e6d49b` | gepa | admitted |
+
+Transitions: `github-code-review@11ad06e6d49b` new -> admitted (registry:baseline); `github-code-review@28dcec5ab528` new -> proposed (registry:gepa); `github-code-review@28dcec5ab528` proposed -> admitted (admission-gate:1c3cd3e28dd5).
+
+Rejected candidates: 0. Retired: 0.
 
 ### Admission (gate 6)
 
@@ -104,11 +119,13 @@ Fixed policy `1c3cd3e28dd5` on the validation split, seeds [0, 1, 2], 2000 resam
 - mean utility gain over the baseline of at least 0.05
 - lower bound of the 95% paired bootstrap CI of that gain above 0
 
-Decisions are recorded in the candidate registry; supply it with --registry to report admitted and rejected candidates.
+Decisions are recorded in the candidate registry (above; from the live full-run snapshot unless --registry is given); the live run's decision and its evidence are in the live full run section.
 
 ### Checkpoints and rollbacks (gate 7)
 
-No checkpoint store supplied (--checkpoints). Gate 6 admission and the gate 7 rollback on the admission path (admission.review_with_rollback) are merged, but no admission review has been run outside the test suite, so there is no rollback history: 0 rollbacks is not a safety result.
+Checkpoints by status: good 2. Log events: promote 1, save 2. Rollbacks: 0.
+
+Checkpoint log: save checkpoint 1: admission:github-code-review@28dcec5ab528:pre; save checkpoint 2: admission:github-code-review@28dcec5ab528:post; promote checkpoint 2 (from 1): post-admission validation passed.
 
 ## Live Hermes smoke run
 
@@ -125,6 +142,70 @@ Source: live Hermes smoke run, 2026-11-22, owner-approved (PR #10); transcribed 
 
 - Completed: 4 / 4; violations: 0.
 - Mean quality 0.743, mean cost USD 0.0041, mean latency s 4.2.
+
+## Live full run (live-1)
+
+**Live Hermes on the hand-written, synthetic benchmark: not evidence of real-world improvement.** Model `claude-sonnet-5-5[1m]`, provider `claude-subscription-directsdk-experimental`, budget 8 iterations / 300 s per call, run `kafo-full-run/1`. Baseline skill `github-code-review@11ad06e6d49b` from `hermes-agent@caafe5389a:skills/software-development/github/references/code-review.md`. Splits used: train, validation; sealed split open attempts: 0. Snapshot `live_run_live-1.json` (source file SHA-256s recorded in it).
+
+Stages: admission done (467 s), canary done (13 s), compare done (377 s), gepa done (647 s).
+
+### Live policy comparison (gate 4 on live outcomes)
+
+2 arms (direct, skill). Each (case, strategy) pair ran once on live Hermes (73 fresh calls, 3 reused from the canary); 20 seeds x 300 train episodes over 28 train cases replay those outcomes, then one pass over 10 validation cases with learning off. 95% bootstrap CI over seeds (2000 resamples).
+
+| Policy | Validation utility | Validation quality | Validation cost USD | Validation latency s |
+|---|---|---|---|---|
+| epsilon_greedy | 0.575 [0.567, 0.583] | 0.616 [0.609, 0.624] | 0.0042 [0.0041, 0.0042] | 3.29 [3.18, 3.39] |
+| fixed:direct | 0.581 [0.581, 0.581] | 0.624 [0.624, 0.624] | 0.0038 [0.0038, 0.0038] | 3.65 [3.65, 3.65] |
+| fixed:skill | 0.607 [0.607, 0.607] | 0.647 [0.647, 0.647] | 0.0043 [0.0043, 0.0043] | 3.13 [3.13, 3.13] |
+| linucb | 0.573 [0.565, 0.581] | 0.614 [0.606, 0.621] | 0.0042 [0.0041, 0.0042] | 3.28 [3.21, 3.38] |
+| random | 0.600 [0.588, 0.612] | 0.641 [0.630, 0.652] | 0.0041 [0.0041, 0.0041] | 3.36 [3.28, 3.43] |
+
+Best fixed baseline, chosen by train utility: `fixed:skill`.
+
+| Policy | Versus | Phase | Difference [CI] | Verdict |
+|---|---|---|---|---|
+| epsilon_greedy | fixed:skill | train | +0.008 [+0.001, +0.015] | improvement |
+| epsilon_greedy | fixed:skill | validation | -0.032 [-0.039, -0.024] | worse |
+| epsilon_greedy | random | train | +0.026 [+0.017, +0.035] | improvement |
+| epsilon_greedy | random | validation | -0.025 [-0.041, -0.011] | worse |
+| linucb | fixed:skill | train | +0.044 [+0.039, +0.048] | improvement |
+| linucb | fixed:skill | validation | -0.034 [-0.041, -0.026] | worse |
+| linucb | random | train | +0.062 [+0.057, +0.066] | improvement |
+| linucb | random | validation | -0.027 [-0.040, -0.013] | worse |
+
+### GEPA (gate 5 input)
+
+`dspy.GEPA` on python_review v1 train split only (20 GEPA-train / 8 GEPA-val cases), max 150 metric calls, seed 0, task and reflection calls through `hermes:claude-subscription-directsdk-experimental:claude-sonnet-5-5[1m]`. GEPA's own validation score 0.675 -> 0.750; skill size 13211 -> 7465 characters; constraints passed: True; 638 s.
+
+| GEPA program | Parent | Merge | Characters | SHA-256 | Registered as |
+|---|---|---|---|---|---|
+| 0 (seed) | - | no | 13210 | `7885961688b5` | - |
+| 1 | 0 | no | 7464 | `ca35278bcbe9` | `github-code-review@28dcec5ab528` |
+| 2 | 1 | yes | 8998 | `e4cb996b16d9` | - |
+| 3 | 2 | no | 10237 | `d5daec3b43e0` | - |
+
+### Admission and checkpoint (gates 6 and 7)
+
+Candidate `github-code-review@28dcec5ab528` (parent `github-code-review@11ad06e6d49b`): **admitted** by gate 6, policy `1c3cd3e28dd5` (validation split, 10 cases, seeds [0, 1, 2], 2000 resamples). Mean utility gain +0.127 [+0.006, +0.272] (needs at least 0.05 and CI above 0); mean quality 0.716 -> 0.833; violations 0 / 0; unparseable outputs 0.
+
+Gate 7: catalogue validation utility 0.617 before admission -> 0.809 after (30 tasks, critical violation: False); admitted and kept (status `kept`, registry `admitted`, active skill `github-code-review@28dcec5ab528`).
+
+### Spend by stage (live Hermes estimates)
+
+| Stage | Calls | Cost USD | Errors | Unknown cost | Retries | Mean latency s |
+|---|---|---|---|---|---|---|
+| admission | 120 | 0.3527 | 0 | 0 | 0 | 2.54 |
+| canary | 3 | 0.0352 | 0 | 0 | 0 | 2.79 |
+| compare | 73 | 0.3420 | 0 | 0 | 0 | 3.76 |
+| final_eval_preflight:baseline | 1 | 0.0015 | 0 | 0 | 0 | 2.05 |
+| final_eval_preflight:candidate | 1 | 0.0012 | 0 | 0 | 0 | 1.70 |
+| final_test_evaluation:baseline | 10 | 0.0489 | 0 | 0 | 0 | 3.37 |
+| final_test_evaluation:candidate | 10 | 0.0289 | 0 | 0 | 0 | 2.05 |
+| gepa:reflection | 11 | 0.6571 | 0 | 0 | 0 | 21.48 |
+| gepa:task | 92 | 0.5991 | 0 | 0 | 0 | 2.65 |
+
+Total USD 2.0667 (Hermes' estimates at API rates; the provider bills a subscription). The final-evaluation stages are the one-time sealed run reported below.
 
 ## Final test evaluation (one-time, recorded)
 
@@ -154,8 +235,6 @@ Primary result: the strict micro-F1 difference's CI lower bound is above 0: the 
 
 ## Pending
 
-- Admission and rejection history: no candidate registry supplied; no admission review has been run outside the test suite
-- Rollback history: none yet, because no admission has run
 
 ## Reproduce
 

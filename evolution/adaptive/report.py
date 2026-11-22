@@ -19,6 +19,13 @@ What it reports, all from merged sprint code:
   retirements, admission and rollback (pluggable, pending until gates 6 and
   7 merge), an optional live Hermes smoke run, and the final test
   evaluation ledger (read only; this module never runs it).
+* The live full run (``full_run``, live Hermes on the hand-written
+  benchmark) from a committed snapshot, ``live_run_live-1.json``: the 2-arm
+  live comparison, GEPA candidates and lineage, the gate 6 admission
+  decision, gate 7 checkpoints, the registry history and per-stage cost.
+  ``--snapshot-live-run <run dir>`` rebuilds that snapshot (read-only on the
+  run dir; aggregates only, never model outputs) so the report stays
+  reproducible without the run directory.
 
 Everything runs inside ``benchmark.optimisation_phase()``, so the sealed test
 split cannot be loaded or opened while the report is generated. The output
@@ -29,7 +36,9 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import hashlib
 import json
+import statistics
 import math
 from pathlib import Path
 import random
@@ -48,6 +57,14 @@ NOTICE = ("SYNTHETIC RESULTS. The policy comparison uses a hypothetical simulato
           "invented success rates, costs and latencies; the verifier scores use reference "
           "reviews derived from the benchmark labels, not a model. Nothing in this report "
           "is evidence that Hermes improves on any real task.")
+SIMULATOR_NOTICE = ("SYNTHETIC RESULTS. The simulator sections (gate 4 policy comparison, "
+                    "simulated cost and latency) use a hypothetical simulator with invented "
+                    "success rates, costs and latencies; the verifier reference scores use "
+                    "reviews derived from the benchmark labels, not a model.")
+NO_REAL_WORLD = ("Nothing in this report is evidence that Hermes improves on any real task: "
+                 "no result here is evidence of real-world improvement.")
+DEFAULT_LIVE_RUN = DEFAULT_OUT / "live_run_live-1.json"
+LIVE_RUN_SCHEMA = "kafo-live-run-snapshot/1"
 NO_CHECKPOINT_STORE = ("no checkpoint store supplied (--checkpoints). Gate 6 admission and "
                        "the gate 7 rollback on the admission path "
                        "(admission.review_with_rollback) are merged, but no admission review "
@@ -166,14 +183,98 @@ def headline(comparison: Mapping) -> list[str]:
     return lines
 
 
-def _with_live(lines: list[str], live: Mapping) -> list[str]:
-    if live["status"] != "supplied":
-        return lines
-    note = (f"A live Hermes smoke run scored {live['n_cases']} {live['split']} cases "
-            f"({live['completed']} completed, {live['violations']} violations). With so few "
-            "cases this is a plumbing check, not a quality estimate.")
-    return lines[:-1] + [note, "Apart from that smoke run, these are results from a "
-                         "hypothetical simulator, not from Hermes."]
+def _signed(iv: Mapping) -> str:
+    return f"{iv['point']:+.3f} [{iv['low']:.3f}, {iv['high']:.3f}]"
+
+
+def _live_parts(live: Mapping, live_run: Mapping, final: Mapping) -> list[str]:
+    parts = []
+    if live_run["status"] == "supplied":
+        parts.append(f"the live full run ({live_run['run_id']})")
+    if final.get("design") == "paired" and final.get("status") == "completed":
+        parts.append("the one-time sealed final evaluation")
+    if live["status"] == "supplied":
+        parts.append(f"a {live['n_cases']}-case smoke test")
+    return parts
+
+
+def _join(parts: Sequence[str]) -> str:
+    return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def report_notice(live: Mapping, live_run: Mapping, final: Mapping) -> str:
+    parts = _live_parts(live, live_run, final)
+    if not parts:
+        return NOTICE
+    joined = _join(parts)
+    model = (live_run.get("identity") or {}).get("model") if live_run["status"] == \
+        "supplied" else None
+    return (f"{SIMULATOR_NOTICE} {_sentence(joined)} used live Hermes"
+            + (f" ({model})" if model else "")
+            + " on the hand-written, synthetic python_review benchmark. " + NO_REAL_WORLD)
+
+
+def lead_findings(live_run: Mapping, final: Mapping) -> list[str]:
+    """Headline lines for the live results, sealed result first."""
+    lines = []
+    if final.get("design") == "paired" and final.get("status") == "completed":
+        d, sv = final["paired"]["strict"], final["skill_versions"]
+        f1, prec, rec = d["micro_f1"], d["micro_precision"], d["micro_recall"]
+        rule = ("above 0, so the pre-registered rule is met" if f1["low"] > 0
+                else "not above 0, so the pre-registered rule is not met")
+        driver = ("mostly precision" if prec["point"] > rec["point"] else
+                  "mostly recall" if rec["point"] > prec["point"] else
+                  "precision and recall alike")
+        lines.append(
+            f"Pre-registered sealed final evaluation (run once, live Hermes, "
+            f"{final['n_cases']} hand-written synthetic test cases): candidate "
+            f"`{sv['candidate']}` minus baseline `{sv['baseline']}`, STRICT micro-F1 "
+            f"{_signed(f1)} (primary; CI lower bound {rule}), {driver} (precision "
+            f"{_signed(prec)}, recall {_signed(rec)}); LENIENT micro-F1 "
+            f"{_signed(final['paired']['lenient']['micro_f1'])} (secondary).")
+    if live_run["status"] == "supplied":
+        c = live_run["compare"]
+        best = c["best_fixed_baseline"]
+        val = [x for x in c["comparisons"] if x["baseline"] == best
+               and x["phase"] == "validation"]
+        better = [x for x in val if x["verdict"] == "improvement"]
+        lines.append(
+            f"Live full run {live_run['run_id']} ({len(c['config']['strategies'])}-arm "
+            f"comparison on live Hermes outcomes, validation split): the best fixed strategy "
+            f"`{best}` has utility {c['policies'][best]['validation']['utility']['mean']:.3f}; "
+            + ("no adaptive policy improves on it: " if not better else "improved on it: ")
+            + "; ".join(f"{x['policy']} {x['mean_diff']:+.3f} [{x['ci_low']:+.3f}, "
+                        f"{x['ci_high']:+.3f}] ({x['verdict']})" for x in val) + ".")
+        a = live_run["admission"]
+        dec = a["decision"]
+        lines.append(
+            f"GEPA candidate `{a['candidate_id']}` (parent `{a['parent_id']}`) was "
+            f"{'admitted' if dec['admitted'] else 'rejected'} by gate 6 with a validation "
+            f"utility gain of {dec['mean_utility_gain']:+.3f} [{dec['ci_low']:+.3f}, "
+            f"{dec['ci_high']:+.3f}]; gate 7's post-admission check then "
+            + ("kept it" if a["status"] == "kept" else f"ended `{a['status']}`")
+            + f" (catalogue validation utility {a['pre_validation']['utility']:.3f} -> "
+            + (f"{a['post_validation']['utility']:.3f})." if a.get("post_validation")
+               else "n/a)."))
+    return lines
+
+
+def compose_headline(comparison: Mapping, live: Mapping, live_run: Mapping,
+                     final: Mapping) -> list[str]:
+    sim = headline(comparison)
+    parts = _live_parts(live, live_run, final)
+    if not parts:
+        return sim
+    lines = lead_findings(live_run, final) + [f"Simulator: {sim[0]}"] + sim[1:-1]
+    if live["status"] == "supplied":
+        lines.append(f"A live Hermes smoke run scored {live['n_cases']} {live['split']} cases "
+                     f"({live['completed']} completed, {live['violations']} violations). With "
+                     "so few cases this is a plumbing check, not a quality estimate.")
+    lines.append("The simulator findings are results from a hypothetical simulator, not from "
+                 "Hermes. " + _sentence(_join(parts)) + " used live Hermes on a "
+                 "hand-written, synthetic benchmark, so none of this is evidence of "
+                 "real-world improvement.")
+    return lines
 
 
 def _registry_summary(path: Optional[str]) -> dict:
@@ -188,10 +289,18 @@ def _registry_summary(path: Optional[str]) -> dict:
         moves = conn.execute(
             "SELECT candidate_id, from_status, to_status, reason, decided_by FROM transitions "
             "WHERE to_status IN ('rejected', 'retired') ORDER BY id").fetchall()
+        lineage = conn.execute("SELECT candidate_id, parent_id, source, status FROM candidates "
+                               "ORDER BY created_at, candidate_id").fetchall()
+        history = conn.execute("SELECT candidate_id, from_status, to_status, decided_by "
+                               "FROM transitions ORDER BY id").fetchall()
     finally:
         conn.close()
     return {"status": "supplied",
             "candidates": [{"source": s, "status": st, "count": n} for s, st, n in by],
+            "lineage": [dict(zip(("candidate_id", "parent_id", "source", "status"), r))
+                        for r in lineage],
+            "transitions": [dict(zip(("candidate_id", "from", "to", "decided_by"), r))
+                            for r in history],
             "rejected": [dict(zip(("candidate_id", "from", "to", "reason", "decided_by"), m))
                          for m in moves if m[2] == "rejected"],
             "retired": [dict(zip(("candidate_id", "from", "to", "reason", "decided_by"), m))
@@ -207,8 +316,9 @@ def admission_section() -> dict:
                       f"mean utility gain over the baseline of at least {policy.min_margin}",
                       f"lower bound of the {int(policy.confidence * 100)}% paired bootstrap "
                       "CI of that gain above 0"],
-            "note": "decisions are recorded in the candidate registry; supply it with "
-                    "--registry to report admitted and rejected candidates"}
+            "note": "decisions are recorded in the candidate registry (above; from the live "
+                    "full-run snapshot unless --registry is given); the live run's decision "
+                    "and its evidence are in the live full run section"}
 
 
 def checkpoint_section(path: Optional[str]) -> dict:
@@ -225,12 +335,129 @@ def checkpoint_section(path: Optional[str]) -> dict:
         rollbacks = conn.execute(
             "SELECT checkpoint_id, from_checkpoint_id, reason FROM checkpoint_log "
             "WHERE event='rollback' ORDER BY id").fetchall()
+        log = conn.execute("SELECT event, checkpoint_id, from_checkpoint_id, reason "
+                           "FROM checkpoint_log ORDER BY id").fetchall()
     finally:
         conn.close()
     return {"status": "supplied",
             "checkpoints": {k: n for k, n in statuses},
             "events": {k: n for k, n in events},
+            "log": [dict(zip(("event", "checkpoint_id", "from", "reason"), r)) for r in log],
             "rollbacks": [{"to": t, "from": f, "reason": r} for t, f, r in rollbacks]}
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _stage_spend(ledger_path: Path) -> dict:
+    """Per-stage call counts, cost and latency from a full-run spend ledger.
+
+    Aggregates only: model outputs (which include replies on sealed test cases
+    for the final evaluation stages) are never copied.
+    """
+    stages: dict[str, dict] = {}
+    total = 0.0
+    for line in ledger_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        st = stages.setdefault(row.get("stage", "?"), {
+            "calls": 0, "errors": 0, "unknown_cost_calls": 0, "retries": 0,
+            "cost_usd": 0.0, "latencies": []})
+        st["calls"] += 1
+        st["errors"] += bool(row.get("error"))
+        st["retries"] += bool(row.get("attempt"))
+        if row.get("cost_usd") is None:
+            st["unknown_cost_calls"] += 1
+        else:
+            st["cost_usd"] += row["cost_usd"]
+            total += row["cost_usd"]
+        if row.get("latency_s") is not None:
+            st["latencies"].append(row["latency_s"])
+    for st in stages.values():
+        lat = st.pop("latencies")
+        st["cost_usd"] = round(st["cost_usd"], 6)
+        st["mean_latency_s"] = round(statistics.fmean(lat), 3) if lat else None
+    return {"by_stage": dict(sorted(stages.items())), "total_cost_usd": round(total, 6)}
+
+
+def snapshot_live_run(run_dir: str | Path) -> dict:
+    """Read-only, aggregate snapshot of a ``full_run`` run directory for the report."""
+    run = Path(run_dir)
+    state = json.loads((run / "state.json").read_text(encoding="utf-8"))
+    rep = json.loads((run / "report.json").read_text(encoding="utf-8"))
+    stages = rep["stages"]
+    cmp_ = stages["compare"]["result"]["report"]
+    gepa = stages["gepa"]["result"]
+    adm = stages["admission"]["result"]
+    files = ["state.json", "report.json", "registry.sqlite", "checkpoints.sqlite",
+             "ledger.jsonl", "gepa_log/candidates.json", "gepa_log/run_log.json"]
+    texts = [c["self"] for c in json.loads(
+        (run / "gepa_log/candidates.json").read_text(encoding="utf-8"))]
+    parents = {e["new_program_idx"]: {"parent": e.get("selected_program_candidate"),
+                                      "merge": bool(e.get("invoked_merge"))}
+               for e in json.loads((run / "gepa_log/run_log.json").read_text(encoding="utf-8"))
+               if isinstance(e, dict) and "new_program_idx" in e}
+    uri = (run / "registry.sqlite").resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        registered = dict(conn.execute(
+            "SELECT candidate_id, content FROM candidates WHERE source = 'gepa'").fetchall())
+    finally:
+        conn.close()
+    candidates = []
+    for i, text in enumerate(texts):
+        hits = sorted(cid for cid, content in registered.items()
+                      if text.strip() and text.strip() in content.decode("utf-8"))
+        candidates.append({"index": i, "chars": len(text),
+                           "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:12],
+                           "parent": parents.get(i, {}).get("parent"),
+                           "merge": parents.get(i, {}).get("merge", False),
+                           "seed": i == 0, "registered_as": hits[0] if hits else None})
+    decision = {k: v for k, v in adm["decision"].items() if k != "case_ids"}
+    return {
+        "schema": LIVE_RUN_SCHEMA, "run_id": run.name,
+        "source_files": {f: _file_sha256(run / f) for f in files},
+        "identity": state["identity"], "baseline_id": state["baseline_id"],
+        "skill_source": rep.get("skill_source"), "splits_used": rep.get("splits_used"),
+        "sealed_split_open_attempts": state.get("sealed_split_open_attempts"),
+        "stages": {k: {"status": v.get("status"), "seconds": v.get("seconds")}
+                   for k, v in stages.items()},
+        "canary": {k: stages["canary"]["result"][k] for k in ("fresh_calls", "replayed_calls")}
+        | {"cases": [{k: c[k] for k in ("case_id", "f1", "cost_usd", "parse_ok")}
+                     for c in stages["canary"]["result"]["cases"]]},
+        "compare": {"best_fixed_baseline": cmp_["best_fixed_baseline"],
+                    "executor_backend": cmp_["executor_backend"],
+                    "executions": cmp_["executions"],
+                    "fresh_calls": stages["compare"]["result"]["fresh_calls"],
+                    "replayed_calls": stages["compare"]["result"]["replayed_calls"],
+                    "config": {k: cmp_["config"][k] for k in (
+                        "strategies", "train_episodes", "train_items", "validation_items",
+                        "bootstrap", "validation_learning")}
+                    | {"seeds": len(cmp_["config"]["seeds"])},
+                    "policies": cmp_["policies"], "comparisons": cmp_["comparisons"]},
+        "gepa": {"metrics": gepa["metrics"], "candidates": candidates},
+        "admission": {"status": adm["status"], "reason": adm["reason"],
+                      "candidate_id": adm["candidate_id"], "parent_id": adm["parent_id"],
+                      "active_skill": adm["active_skill"],
+                      "registry_status": adm["registry_status"], "decision": decision,
+                      "pre_validation": adm["pre_validation"],
+                      "post_validation": adm["post_validation"]},
+        "registry": _registry_summary(str(run / "registry.sqlite")),
+        "checkpoints": checkpoint_section(str(run / "checkpoints.sqlite")),
+        "spend": _stage_spend(run / "ledger.jsonl"),
+    }
+
+
+def live_run_section(path: Optional[str]) -> dict:
+    if path is None or not Path(path).exists():
+        return {"status": "not supplied", "note": "no live full-run snapshot supplied "
+                "(--live-run)"}
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if data.get("schema") != LIVE_RUN_SCHEMA:
+        raise ValueError(f"{Path(path).name} is not a {LIVE_RUN_SCHEMA} snapshot")
+    return {"status": "supplied", "file": Path(path).name, **data}
 
 
 def _finite_or_none(value) -> Optional[float]:
@@ -377,17 +604,26 @@ def generate(*, seeds: int = 20, train_episodes: int = 300, benchmark_seed: int 
              resamples: int = 2000, verifier_seed: int = 0, verifier_bootstrap: int = 1000,
              registry_path: Optional[str] = None, checkpoint_path: Optional[str] = None,
              live_smoke_path: Optional[str] = str(DEFAULT_LIVE_SMOKE),
+             live_run_path: Optional[str] = str(DEFAULT_LIVE_RUN),
              final_ledger_path: Path = DEFAULT_LEDGER,
              generated_at: Optional[str] = None) -> dict:
-    """Build the report dict. Runs entirely inside optimisation_phase()."""
+    """Build the report dict. Runs entirely inside optimisation_phase().
+
+    Registry and checkpoint history come from ``registry_path`` and
+    ``checkpoint_path`` if given, otherwise from the live-run snapshot.
+    """
     with optimisation_phase():
         attempts_before = sealed_access_attempts()
         comparison, violations = comparison_section(
             seeds=seeds, train_episodes=train_episodes, benchmark_seed=benchmark_seed,
             resamples=resamples)
         verifier_scores = verifier_section(seed=verifier_seed, n_bootstrap=verifier_bootstrap)
-        registry = _registry_summary(registry_path)
-        checkpoints = checkpoint_section(checkpoint_path)
+        live_run = live_run_section(live_run_path)
+        from_run = live_run["status"] == "supplied"
+        registry = (live_run["registry"] if registry_path is None and from_run
+                    else _registry_summary(registry_path))
+        checkpoints = (live_run["checkpoints"] if checkpoint_path is None and from_run
+                       else checkpoint_section(checkpoint_path))
         live = live_smoke_section(live_smoke_path)
         final = final_evaluation_section(Path(final_ledger_path))
         blocked = sealed_access_attempts() - attempts_before
@@ -405,9 +641,7 @@ def generate(*, seeds: int = 20, train_episodes: int = 300, benchmark_seed: int 
         pending.append("final test evaluation: not run (owner decision)")
     return {
         "schema": SCHEMA, "title": "KAFO-EVO-001 sprint report", "synthetic": True,
-        "notice": NOTICE if live["status"] != "supplied" else NOTICE + (
-            f" The only live data is a {live['n_cases']}-case Hermes smoke test, reported "
-            "separately as a plumbing check."),
+        "notice": report_notice(live, live_run, final),
         "generated_at": generated_at,
         "settings": {"seeds": seeds, "train_episodes": train_episodes,
                      "benchmark_seed": benchmark_seed, "comparison_resamples": resamples,
@@ -416,13 +650,14 @@ def generate(*, seeds: int = 20, train_episodes: int = 300, benchmark_seed: int 
                      "checkpoints": None if checkpoint_path is None
                      else Path(checkpoint_path).name,
                      "live_smoke": None if live_smoke_path is None else Path(live_smoke_path).name,
+                     "live_run": live_run.get("file"),
                      "final_ledger": _rel(Path(final_ledger_path))},
         "provenance": {"benchmark": {"name": benchmark.BENCHMARK_NAME,
                                      "version": benchmark.DEFAULT_VERSION,
                                      "manifest_sha256": benchmark.PINNED_MANIFEST_SHA256.get(
                                          benchmark.DEFAULT_VERSION)},
                        "verifier": verifier_scores.pop("provenance")},
-        "headline": _with_live(headline(comparison), live),
+        "headline": compose_headline(comparison, live, live_run, final),
         "policy_comparison": comparison,
         "verifier_scores": verifier_scores,
         "safety": {"critical_violations": {"total_steps": total_steps,
@@ -433,6 +668,7 @@ def generate(*, seeds: int = 20, train_episodes: int = 300, benchmark_seed: int 
                    "admission": admission_section(),
                    "rollbacks": checkpoints},
         "live_smoke": live,
+        "live_run": live_run,
         "final_test_evaluation": final,
         "pending": pending,
     }
@@ -450,6 +686,88 @@ def _ci(stat: Mapping, fmt: str = ".3f") -> str:
 
 def _iv(iv: Mapping) -> str:
     return f"{iv['point']:.3f} [{iv['low']:.3f}, {iv['high']:.3f}]"
+
+
+def _live_run_markdown(run: Mapping) -> list[str]:
+    if run["status"] != "supplied":
+        return []
+    ident, c, g, a = run["identity"], run["compare"], run["gepa"], run["admission"]
+    cfg, m, dec = c["config"], g["metrics"], a["decision"]
+    L = [f"## Live full run ({run['run_id']})", "",
+         f"**Live Hermes on the hand-written, synthetic benchmark: not evidence of "
+         f"real-world improvement.** Model `{ident['model']}`, provider "
+         f"`{ident['provider']}`, budget {ident['budget']['max_iterations']} iterations / "
+         f"{ident['budget']['timeout_s']:.0f} s per call, run `{ident['run_version']}`. "
+         f"Baseline skill `{run['baseline_id']}` from `{run['skill_source']}`. Splits used: "
+         f"{', '.join(run['splits_used'])}; sealed split open attempts: "
+         f"{run['sealed_split_open_attempts']}. Snapshot `{run['file']}` (source file "
+         "SHA-256s recorded in it).", "",
+         "Stages: " + ", ".join(f"{k} {v['status']} ({v['seconds']:.0f} s)"
+                                for k, v in run["stages"].items()) + ".", "",
+         "### Live policy comparison (gate 4 on live outcomes)", "",
+         f"{len(cfg['strategies'])} arms ({', '.join(cfg['strategies'])}). Each (case, "
+         f"strategy) pair ran once on live Hermes ({c['fresh_calls']} fresh calls, "
+         f"{c['replayed_calls']} reused from the canary); {cfg['seeds']} seeds x "
+         f"{cfg['train_episodes']} train episodes over {cfg['train_items']} train cases replay "
+         f"those outcomes, then one pass over {cfg['validation_items']} validation cases with "
+         f"learning off. {int(cfg['bootstrap']['confidence'] * 100)}% bootstrap CI over seeds "
+         f"({cfg['bootstrap']['resamples']} resamples).", "",
+         "| Policy | Validation utility | Validation quality | Validation cost USD | "
+         "Validation latency s |", "|---|---|---|---|---|"]
+    for name, pol in c["policies"].items():
+        v = pol["validation"]
+        L.append(f"| {name} | {_ci(v['utility'])} | {_ci(v['quality'])} | "
+                 f"{_ci(v['cost_usd'], '.4f')} | {_ci(v['latency_s'], '.2f')} |")
+    L += ["", f"Best fixed baseline, chosen by train utility: `{c['best_fixed_baseline']}`.", "",
+          "| Policy | Versus | Phase | Difference [CI] | Verdict |", "|---|---|---|---|---|"]
+    L += [f"| {x['policy']} | {x['baseline']} | {x['phase']} | {x['mean_diff']:+.3f} "
+          f"[{x['ci_low']:+.3f}, {x['ci_high']:+.3f}] | {x['verdict']} |"
+          for x in c["comparisons"]]
+    L += ["", "### GEPA (gate 5 input)", "",
+          f"`{m['optimizer']}` on {m['data']} ({m['gepa_train_cases']} GEPA-train / "
+          f"{m['gepa_val_cases']} GEPA-val cases), max {m['max_metric_calls']} metric calls, "
+          f"seed {m['seed']}, task and reflection calls through "
+          f"`{m['lm_route']['task']}`. GEPA's own validation score {m['baseline_score']:.3f} -> "
+          f"{m['evolved_score']:.3f}; skill size {m['baseline_size']} -> "
+          f"{m['evolved_size']} characters; constraints passed: {m['constraints_passed']}; "
+          f"{m['elapsed_seconds']:.0f} s.", "",
+          "| GEPA program | Parent | Merge | Characters | SHA-256 | Registered as |",
+          "|---|---|---|---|---|---|"]
+    for cand in g["candidates"]:
+        L.append(f"| {cand['index']}{' (seed)' if cand['seed'] else ''} | "
+                 f"{'-' if cand['parent'] is None else cand['parent']} | "
+                 f"{'yes' if cand['merge'] else 'no'} | {cand['chars']} | "
+                 f"`{cand['sha256']}` | "
+                 + (f"`{cand['registered_as']}`" if cand["registered_as"] else "-") + " |")
+    pol = dec["policy"]
+    L += ["", "### Admission and checkpoint (gates 6 and 7)", "",
+          f"Candidate `{a['candidate_id']}` (parent `{a['parent_id']}`): "
+          f"**{'admitted' if dec['admitted'] else 'rejected'}** by gate 6, policy "
+          f"`{dec['policy_sha256'][:12]}` ({pol['split']} split, {dec['n_cases']} cases, seeds "
+          f"{pol['seeds']}, {pol['n_bootstrap']} resamples). Mean utility gain "
+          f"{dec['mean_utility_gain']:+.3f} [{dec['ci_low']:+.3f}, {dec['ci_high']:+.3f}] "
+          f"(needs at least {pol['min_margin']} and CI above 0); mean quality "
+          f"{dec['baseline_mean_quality']:.3f} -> {dec['candidate_mean_quality']:.3f}; "
+          f"violations {dec['baseline_violations']} / {dec['candidate_violations']}; "
+          f"unparseable outputs {dec['unparseable_outputs']}.",
+          "", f"Gate 7: catalogue validation utility {a['pre_validation']['utility']:.3f} "
+          f"before admission -> {a['post_validation']['utility']:.3f} after "
+          f"({a['post_validation']['n_tasks']} tasks, critical violation: "
+          f"{a['post_validation']['critical_violation']}); {a['reason']} (status "
+          f"`{a['status']}`, registry `{a['registry_status']}`, active skill "
+          f"`{a['active_skill']}`).", "",
+          "### Spend by stage (live Hermes estimates)", "",
+          "| Stage | Calls | Cost USD | Errors | Unknown cost | Retries | Mean latency s |",
+          "|---|---|---|---|---|---|---|"]
+    for name, st in run["spend"]["by_stage"].items():
+        L.append(f"| {name} | {st['calls']} | {st['cost_usd']:.4f} | {st['errors']} | "
+                 f"{st['unknown_cost_calls']} | {st['retries']} | "
+                 + ("n/a" if st["mean_latency_s"] is None else f"{st['mean_latency_s']:.2f}")
+                 + " |")
+    L += ["", f"Total USD {run['spend']['total_cost_usd']:.4f} (Hermes' estimates at API rates; "
+          "the provider bills a subscription). The final-evaluation stages are the one-time "
+          "sealed run reported below.", ""]
+    return L
 
 
 def format_markdown(report: Mapping) -> str:
@@ -545,6 +863,14 @@ def format_markdown(report: Mapping) -> str:
     if reg["status"] == "supplied":
         L += ["| Source | Status | Candidates |", "|---|---|---|"]
         L += [f"| {c['source']} | {c['status']} | {c['count']} |" for c in reg["candidates"]]
+        if reg.get("lineage"):
+            L += ["", "| Candidate | Parent | Source | Status |", "|---|---|---|---|"]
+            L += [f"| `{c['candidate_id']}` | " + (f"`{c['parent_id']}`" if c["parent_id"]
+                                                  else "-")
+                  + f" | {c['source']} | {c['status']} |" for c in reg["lineage"]]
+            L += ["", "Transitions: " + "; ".join(
+                f"`{t['candidate_id']}` {t['from'] or 'new'} -> {t['to']} ({t['decided_by']})"
+                for t in reg["transitions"]) + "."]
         L += ["", f"Rejected candidates: {len(reg['rejected'])}. Retired: "
               f"{len(reg['retired'])}."]
         L += [f"- `{m['candidate_id']}` {m['from']} -> {m['to']} by {m['decided_by']}: "
@@ -567,6 +893,11 @@ def format_markdown(report: Mapping) -> str:
                                     or "none") + f". Rollbacks: {len(rb['rollbacks'])}."]
         L += [f"- checkpoint {r['from']} rolled back to {r['to']}: {r['reason']}"
               for r in rb["rollbacks"]]
+        if rb.get("log"):
+            L += ["", "Checkpoint log: " + "; ".join(
+                f"{e['event']} checkpoint {e['checkpoint_id']}"
+                + (f" (from {e['from']})" if e["from"] is not None else "")
+                + f": {e['reason']}" for e in rb["log"]) + "."]
         L.append("")
     else:
         L += [_sentence(rb["note"]) + ".", ""]
@@ -591,6 +922,8 @@ def format_markdown(report: Mapping) -> str:
               f"{num(live['mean_latency_s'], '.1f')}.", ""]
     else:
         L += [_sentence(live["note"]) + ".", ""]
+
+    L += _live_run_markdown(report["live_run"])
 
     fe = report["final_test_evaluation"]
     L += ["## Final test evaluation (one-time, recorded)", ""]
@@ -659,18 +992,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--checkpoints", help="gate 7 checkpoint store SQLite file (read-only)")
     parser.add_argument("--live-smoke", default=str(DEFAULT_LIVE_SMOKE),
                         help="live Hermes smoke results JSON ('' to omit)")
+    parser.add_argument("--live-run", default=str(DEFAULT_LIVE_RUN),
+                        help="live full-run snapshot JSON ('' to omit)")
+    parser.add_argument("--snapshot-live-run", metavar="RUN_DIR",
+                        help="first rebuild the --live-run snapshot from a full_run "
+                        "directory (read-only; aggregates only)")
     parser.add_argument("--final-ledger", default=str(DEFAULT_LEDGER))
     parser.add_argument("--generated-at", help="timestamp to print (omitted by default "
                         "so the output is reproducible)")
     args = parser.parse_args(argv)
     if min(args.seeds, args.train_episodes, args.resamples, args.verifier_resamples) < 1:
         parser.error("--seeds, --train-episodes and resample counts must be positive")
+    if args.snapshot_live_run:
+        if not args.live_run:
+            parser.error("--snapshot-live-run needs a --live-run output path")
+        snap = snapshot_live_run(args.snapshot_live_run)
+        Path(args.live_run).write_text(json.dumps(snap, indent=2, sort_keys=True,
+                                                  allow_nan=False) + "\n", encoding="utf-8")
+        print(f"wrote {_rel(Path(args.live_run))}")
     report = generate(seeds=args.seeds, train_episodes=args.train_episodes,
                       benchmark_seed=args.benchmark_seed, resamples=args.resamples,
                       verifier_seed=args.verifier_seed,
                       verifier_bootstrap=args.verifier_resamples,
                       registry_path=args.registry, checkpoint_path=args.checkpoints,
                       live_smoke_path=args.live_smoke or None,
+                      live_run_path=args.live_run or None,
                       final_ledger_path=Path(args.final_ledger),
                       generated_at=args.generated_at)
     md, js = write_report(report, Path(args.out))
