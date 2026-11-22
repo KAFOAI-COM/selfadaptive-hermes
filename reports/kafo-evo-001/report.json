@@ -1,7 +1,311 @@
 {
   "final_test_evaluation": {
-    "note": "the one-time final test evaluation has not been run; when and on which reviewer is an owner decision",
-    "status": "not run"
+    "alternates": {
+      "defects_in_split": 3,
+      "n_defects": 15,
+      "sha256": "042fbfaca8018664de4b3f4b1a14a0831098d1cb3deb865aee2510bed7b06dbd",
+      "table": "category_alternates_v1.json"
+    },
+    "analysis_plan": {
+      "ci": "95% paired percentile bootstrap over cases: 10000 resamples of case indices (random.Random(0), cases sorted by case_id), the same resamples for both skills, linearly interpolated quantiles",
+      "confidence": 0.95,
+      "descriptive": "per-skill micro precision, recall and F1 and macro F1 with CIs; paired macro-F1, micro-precision and micro-recall differences; cost, completions, parse failures, violations",
+      "design": "paired: the baseline and the candidate skill each review the same sealed test cases once (sample 0), same model, provider, budget, prompt and parser; calls interleave per case, in case_id order the baseline goes first on the 1st, 3rd, ... case and the candidate on the 2nd, 4th, ...",
+      "id": "kafo-evo-001-final-eval-plan/1",
+      "interpretation": "the candidate counts as better on the sealed test only if the primary CI lower bound is above 0; the secondary result cannot override the primary; synthetic hand-written cases, so no claim of a real Hermes improvement",
+      "missing_data": "a call that errors or reports no cost is re-sent once automatically by the spend-ledger wrapper (as in the full run); a call still failed after that, skipped (cost cap) or unparseable is scored as an empty review for that skill and case; nothing else is re-run",
+      "n_bootstrap": 10000,
+      "primary": "candidate minus baseline micro-F1 under STRICT scoring (gate 3 verifier, exact normalised category)",
+      "secondary": "candidate minus baseline micro-F1 under LENIENT scoring (strict rules, plus the label audit's alternate categories)",
+      "seed": 0
+    },
+    "analysis_plan_sha256": "345f05baf846d654fc7c993f58bbf01feda5db7c5a763ab238500723bdf31b71",
+    "benchmark": {
+      "manifest_sha256": "fada5f14b7d89c0e081f820475ce52a51ecc585abfe2264de09f38c69cfb7282",
+      "name": "python_review",
+      "version": "v1"
+    },
+    "design": "paired",
+    "finished_at": "2026-11-22T19:59:57.471797+00:00",
+    "n_cases": 10,
+    "paired": {
+      "lenient": {
+        "macro_f1": {
+          "high": 0.4833333333333333,
+          "low": 0.11666666666666659,
+          "point": 0.2833333333333332
+        },
+        "micro_f1": {
+          "high": 0.4736842105263158,
+          "low": 0.19443181818181826,
+          "point": 0.3324808184143222
+        },
+        "micro_precision": {
+          "high": 0.6111111111111112,
+          "low": 0.30000000000000004,
+          "point": 0.5
+        },
+        "micro_recall": {
+          "high": 0.375,
+          "low": 0.0,
+          "point": 0.11111111111111105
+        }
+      },
+      "strict": {
+        "macro_f1": {
+          "high": 0.46666666666666656,
+          "low": 0.06666666666666676,
+          "point": 0.2499999999999999
+        },
+        "micro_f1": {
+          "high": 0.46153846153846156,
+          "low": 0.1568398119481713,
+          "point": 0.30179028132992325
+        },
+        "micro_precision": {
+          "high": 0.6,
+          "low": 0.25974025974025977,
+          "point": 0.44642857142857145
+        },
+        "micro_recall": {
+          "high": 0.375,
+          "low": 0.0,
+          "point": 0.11111111111111116
+        }
+      }
+    },
+    "primary": "strict.micro_f1",
+    "reviewer_id": "hermes:claude-sonnet-5-5[1m]:claude-subscription-directsdk-experimental:review",
+    "reviewer_summaries": {
+      "baseline": {
+        "backend": "hermes",
+        "calls": 10,
+        "completed": 10,
+        "cost_statuses": {
+          "estimated": 10
+        },
+        "exceptions": 0,
+        "max_total_cost_usd": 2.0,
+        "meter_total_cost_usd": 0.077868,
+        "model": "claude-sonnet-5-5[1m]",
+        "provider": "claude-subscription-directsdk-experimental",
+        "skipped": 0,
+        "stopped": null,
+        "strategy_id": "review:github-code-review@11ad06e6d49b",
+        "toolsets": [],
+        "total_cost_usd": 0.048931,
+        "unparseable": 1,
+        "violations": 0
+      },
+      "candidate": {
+        "backend": "hermes",
+        "calls": 10,
+        "completed": 10,
+        "cost_statuses": {
+          "estimated": 10
+        },
+        "exceptions": 0,
+        "max_total_cost_usd": 2.0,
+        "meter_total_cost_usd": 0.077868,
+        "model": "claude-sonnet-5-5[1m]",
+        "provider": "claude-subscription-directsdk-experimental",
+        "skipped": 0,
+        "stopped": null,
+        "strategy_id": "review:github-code-review@28dcec5ab528",
+        "toolsets": [],
+        "total_cost_usd": 0.028937,
+        "unparseable": 0,
+        "violations": 0
+      }
+    },
+    "scores": {
+      "lenient": {
+        "baseline": {
+          "macro": {
+            "f1": {
+              "high": 0.8666666666666666,
+              "low": 0.4833333333333333,
+              "point": 0.6833333333333333
+            },
+            "precision": {
+              "high": 0.8333333333333334,
+              "low": 0.4,
+              "point": 0.6166666666666667
+            },
+            "recall": {
+              "high": 1.0,
+              "low": 0.65,
+              "point": 0.85
+            }
+          },
+          "micro": {
+            "f1": {
+              "high": 0.7619047619047619,
+              "low": 0.5,
+              "point": 0.6086956521739131
+            },
+            "precision": {
+              "high": 0.7,
+              "low": 0.3888888888888889,
+              "point": 0.5
+            },
+            "recall": {
+              "high": 1.0,
+              "low": 0.5454545454545454,
+              "point": 0.7777777777777778
+            }
+          },
+          "totals": {
+            "false_negatives": 2,
+            "false_positives": 7,
+            "true_positives": 7
+          }
+        },
+        "candidate": {
+          "macro": {
+            "f1": {
+              "high": 1.0,
+              "low": 0.9,
+              "point": 0.9666666666666666
+            },
+            "precision": {
+              "high": 1.0,
+              "low": 1.0,
+              "point": 1.0
+            },
+            "recall": {
+              "high": 1.0,
+              "low": 0.85,
+              "point": 0.95
+            }
+          },
+          "micro": {
+            "f1": {
+              "high": 1.0,
+              "low": 0.8333333333333334,
+              "point": 0.9411764705882353
+            },
+            "precision": {
+              "high": 1.0,
+              "low": 1.0,
+              "point": 1.0
+            },
+            "recall": {
+              "high": 1.0,
+              "low": 0.7142857142857143,
+              "point": 0.8888888888888888
+            }
+          },
+          "totals": {
+            "false_negatives": 1,
+            "false_positives": 0,
+            "true_positives": 8
+          }
+        }
+      },
+      "strict": {
+        "baseline": {
+          "macro": {
+            "f1": {
+              "high": 0.8333333333333334,
+              "low": 0.3833333333333333,
+              "point": 0.6166666666666667
+            },
+            "precision": {
+              "high": 0.8,
+              "low": 0.3333333333333333,
+              "point": 0.5666666666666667
+            },
+            "recall": {
+              "high": 1.0,
+              "low": 0.5,
+              "point": 0.75
+            }
+          },
+          "micro": {
+            "f1": {
+              "high": 0.7142857142857143,
+              "low": 0.32,
+              "point": 0.5217391304347826
+            },
+            "precision": {
+              "high": 0.6666666666666666,
+              "low": 0.26282894736842394,
+              "point": 0.42857142857142855
+            },
+            "recall": {
+              "high": 1.0,
+              "low": 0.375,
+              "point": 0.6666666666666666
+            }
+          },
+          "totals": {
+            "false_negatives": 3,
+            "false_positives": 8,
+            "true_positives": 6
+          }
+        },
+        "candidate": {
+          "macro": {
+            "f1": {
+              "high": 1.0,
+              "low": 0.6333333333333333,
+              "point": 0.8666666666666666
+            },
+            "precision": {
+              "high": 1.0,
+              "low": 0.7,
+              "point": 0.9
+            },
+            "recall": {
+              "high": 1.0,
+              "low": 0.6,
+              "point": 0.85
+            }
+          },
+          "micro": {
+            "f1": {
+              "high": 1.0,
+              "low": 0.5555555555555556,
+              "point": 0.8235294117647058
+            },
+            "precision": {
+              "high": 1.0,
+              "low": 0.6,
+              "point": 0.875
+            },
+            "recall": {
+              "high": 1.0,
+              "low": 0.5,
+              "point": 0.7777777777777778
+            }
+          },
+          "totals": {
+            "false_negatives": 2,
+            "false_positives": 1,
+            "true_positives": 7
+          }
+        }
+      }
+    },
+    "secondary": "lenient.micro_f1",
+    "skill_versions": {
+      "baseline": "github-code-review@11ad06e6d49b",
+      "candidate": "github-code-review@28dcec5ab528"
+    },
+    "started_at": "2026-11-22T19:58:35.764887+00:00",
+    "status": "completed",
+    "synthetic": true,
+    "verifier": {
+      "config": {
+        "category_aliases": [],
+        "line_tolerance": 1,
+        "min_overlap_ratio": 0.5
+      },
+      "match_rule": "category-equal+line-overlap/1",
+      "verifier_sha256": "f3310b479ff67439dbf4cadf8de834ecf5b4056ae30d98c70923f46157f2ec92",
+      "verifier_version": "kafo-verifier/1"
+    }
   },
   "generated_at": null,
   "headline": [
@@ -62,8 +366,7 @@
   "notice": "SYNTHETIC RESULTS. The policy comparison uses a hypothetical simulator with invented success rates, costs and latencies; the verifier scores use reference reviews derived from the benchmark labels, not a model. Nothing in this report is evidence that Hermes improves on any real task. The only live data is a 4-case Hermes smoke test, reported separately as a plumbing check.",
   "pending": [
     "admission and rejection history: no candidate registry supplied; no admission review has been run outside the test suite",
-    "rollback history: none yet, because no admission has run",
-    "final test evaluation: not run (owner decision)"
+    "rollback history: none yet, because no admission has run"
   ],
   "policy_comparison": {
     "benchmark": "synthetic-python-review/1",

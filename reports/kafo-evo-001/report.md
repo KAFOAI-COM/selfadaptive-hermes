@@ -128,13 +128,34 @@ Source: live Hermes smoke run, 2026-11-22, owner-approved (PR #10); transcribed 
 
 ## Final test evaluation (one-time, recorded)
 
-The one-time final test evaluation has not been run; when and on which reviewer is an owner decision. It will be the pre-registered paired run (baseline and candidate skill on the same sealed cases; strict scoring primary, lenient secondary; see docs/sprints/KAFO-EVO-001.md), through `evolution.adaptive.final_evaluation.run_paired_final_evaluation`, which refuses a second run.
+Status **completed**, paired design, started 2026-11-22T19:58:35.764887+00:00, finished 2026-11-22T19:59:57.471797+00:00, reviewer `hermes:claude-sonnet-5-5[1m]:claude-subscription-directsdk-experimental:review`, synthetic: True. Baseline `github-code-review@11ad06e6d49b`, candidate `github-code-review@28dcec5ab528`. Pre-registered plan `kafo-evo-001-final-eval-plan/1` (sha256 `345f05baf846`); lenient table `category_alternates_v1.json` (sha256 `042fbfaca801`).
+
+- baseline: model `claude-sonnet-5-5[1m]` (provider `claude-subscription-directsdk-experimental`), strategy `review:github-code-review@11ad06e6d49b`, cost USD 0.048931 (statuses {'estimated': 10}, shared cap 2.0), calls 10, completed 10, unparseable 1, violations 0, exceptions 0, skipped 0.
+
+- candidate: model `claude-sonnet-5-5[1m]` (provider `claude-subscription-directsdk-experimental`), strategy `review:github-code-review@28dcec5ab528`, cost USD 0.028937 (statuses {'estimated': 10}, shared cap 2.0), calls 10, completed 10, unparseable 0, violations 0, exceptions 0, skipped 0.
+
+10 sealed test cases, the same for both skills.
+
+| Scoring | Skill | Micro F1 | Micro precision | Micro recall | Macro F1 |
+|---|---|---|---|---|---|
+| STRICT (primary) | baseline | 0.522 [0.320, 0.714] | 0.429 [0.263, 0.667] | 0.667 [0.375, 1.000] | 0.617 [0.383, 0.833] |
+| STRICT (primary) | candidate | 0.824 [0.556, 1.000] | 0.875 [0.600, 1.000] | 0.778 [0.500, 1.000] | 0.867 [0.633, 1.000] |
+| LENIENT (secondary) | baseline | 0.609 [0.500, 0.762] | 0.500 [0.389, 0.700] | 0.778 [0.545, 1.000] | 0.683 [0.483, 0.867] |
+| LENIENT (secondary) | candidate | 0.941 [0.833, 1.000] | 1.000 [1.000, 1.000] | 0.889 [0.714, 1.000] | 0.967 [0.900, 1.000] |
+
+Paired difference, candidate minus baseline, 95% paired bootstrap CI:
+
+| Scoring | Micro F1 | Macro F1 | Micro precision | Micro recall |
+|---|---|---|---|---|
+| STRICT (primary) | 0.302 [0.157, 0.462] | 0.250 [0.067, 0.467] | 0.446 [0.260, 0.600] | 0.111 [0.000, 0.375] |
+| LENIENT (secondary) | 0.332 [0.194, 0.474] | 0.283 [0.117, 0.483] | 0.500 [0.300, 0.611] | 0.111 [0.000, 0.375] |
+
+Primary result: the strict micro-F1 difference's CI lower bound is above 0: the candidate is better on the sealed test under the pre-registered rule. Synthetic hand-written cases: not evidence of a real Hermes improvement.
 
 ## Pending
 
 - Admission and rejection history: no candidate registry supplied; no admission review has been run outside the test suite
 - Rollback history: none yet, because no admission has run
-- Final test evaluation: not run (owner decision)
 
 ## Reproduce
 
