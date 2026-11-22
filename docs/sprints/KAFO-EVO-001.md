@@ -88,7 +88,7 @@ Hermes improves on any real task.**
       (185 passed, Python 3.12 + dspy 3.5.0; Python 3.14 has no dspy install here).
 - [x] Implement a Hermes executor adapter using an actually supported API
       (`AIAgent.run_conversation`, contract-checked against hermes-agent source;
-      offline tests only — **no live Hermes/LLM run yet**, see "Hermes executor (gate 1)").
+      plus a 4-case live smoke run on 2026-11-22, see "Hermes executor (gate 1)").
 - [x] Build labelled Python-review benchmark with ground-truth defect IDs.
       (`datasets/python_review/v1`: 48 hand-written synthetic cases, 50 defects,
       8 clean controls; train 28 / validation 10 / sealed test 10; SHA-256
@@ -124,7 +124,13 @@ Hermes improves on any real task.**
       **stubbed GEPA output directory only; no live GEPA/LLM run**. Admission is
       the next gate).
 - [ ] Require candidate-vs-baseline validation before candidate admission.
-- [ ] Implement policy/skill checkpoint and rollback.
+- [x] Implement policy/skill checkpoint and rollback.
+      (`evolution/adaptive/checkpoint.py`, PR #9; 45 offline tests, full suite
+      475 passed on GitHub Actions. See "Checkpoint and rollback (gate 7)".
+      Limits: the trigger wraps a caller-supplied `admit`, because the admission
+      gate (candidate-vs-baseline validation) is still open; skill rollback
+      restores the skill version ID only and is not yet wired to the gate 5
+      candidate registry. Synthetic data only.)
 - [ ] Publish quality, utility, cost, latency, uncertainty and safety report.
 
 ## Hermes executor (gate 1)
@@ -177,10 +183,42 @@ an unknown cost is refused. `loop_executor(...)` plugs an executor into
 
 - `HermesExecutor` refuses to run unless constructed with `allow_live=True`;
   a live run spends LLM credit from the local Hermes configuration.
-- **No live run against real Hermes and a real model has been done yet.**
-  Evidence so far: offline unit tests, a real subprocess run of the bridge
-  against a stub `run_agent`, and an AST contract test against the local
-  hermes-agent source (skipped on CI, which has no checkout).
+- Offline evidence: unit tests, a real subprocess run of the bridge against a
+  stub `run_agent`, and an AST contract test against the local hermes-agent
+  source. The contract test is skipped on CI, which has no checkout; it passed
+  locally against `caafe5389a` on 2026-11-22.
+- `model` must be passed explicitly. `AIAgent(model="")` does not resolve the
+  configured model: the provider failed with `model is required`. A live
+  `HermesExecutor` with no model now raises `ValueError` before any call.
+- `HERMES_PYTHON` must be Hermes' own PM interpreter. On the test machine that
+  was `~/.hermes/tools/python-3.14.9+…/bin/python3`, shown by
+  `hermes --print-runtime-command`. Set `HERMES_DISABLE_LAZY_INSTALLS=1` so
+  Hermes' launch path never syncs or installs dependencies.
+
+### Live smoke run (2026-11-22, owner-approved, cap USD 5)
+
+**Four cases. This is a plumbing check, not evidence that Hermes improves or
+performs well.** Model `claude-sonnet-5-5[1m]`, provider
+`claude-subscription-directsdk-experimental` (the local Hermes default: the
+`claude` CLI with no built-in tools, no user settings or MCP, one turn). No
+toolsets. Budget: 2 iterations, 240 s, 2000 max tokens, USD 1 per case.
+Validation-split cases only, scored by `evolution.adaptive.verifier`.
+
+| Case | Difficulty | Defects | Tokens out / total | Est. cost USD | Latency s | P / R / F1 |
+|---|---|---|---|---|---|---|
+| pyrev-007 | simple | 1 | 321 / 1647 | 0.0041 | 4.3 | 0.33 / 1.00 / 0.50 |
+| pyrev-008 | moderate | 1 | 320 / 1687 | 0.0045 | 3.7 | 0.50 / 1.00 / 0.67 |
+| pyrev-031 | moderate | 0 (clean) | 4 / 1388 | 0.0014 | 3.7 | 1.00 / 1.00 / 1.00 |
+| pyrev-043 | complex | 2 | 474 / 1890 | 0.0063 | 5.2 | 0.67 / 1.00 / 0.80 |
+
+- No errors, tool calls or violations. The Hermes checkout was unchanged.
+- Estimated spend across all attempts: about USD 0.025. This includes an
+  earlier single-case run; a first attempt failed before any model call.
+- `cost_status` was `estimated`, which Hermes prices at API rates. The
+  provider bills the Claude subscription, so metered spend may be zero.
+- Most tokens are cache read/write: `input_tokens` was 373 uncached on every
+  case. The bridge now carries `cache_read_tokens` and `cache_write_tokens`.
+- One run, n=4, no confidence intervals.
 - Cost covers the main agent loop only; Hermes reports auxiliary calls
   (title generation, compression, …) separately and they are not included.
 - `python` must be an interpreter that can import hermes-agent
@@ -273,6 +311,81 @@ measured against a baseline picked in hindsight on the same train data, so it
 does not show generalisation. Fixed-policy validation intervals have zero width
 because those runs are deterministic. **This is a hypothetical simulator: none
 of it is evidence about Hermes.**
+
+## Checkpoint and rollback (gate 7)
+
+`evolution/adaptive/checkpoint.py`. Checkpoints live in the SQLite knowledge
+store next to `ExperienceStore` (new tables `policy_checkpoints`,
+`checkpoint_log`, `checkpoint_active`; the experience schema and its
+`user_version` are unchanged). Pass an `ExperienceStore` to share its file.
+
+### What a checkpoint holds
+
+Sequence number, policy kind, policy version, active skill version, label,
+UTC creation time, the validation result it was saved with, and the policy
+state: epsilon-greedy counts and means, LinUCB `A^-1`, `b` and counts, and the
+RNG state for every seeded policy (fixed, random, epsilon-greedy, LinUCB,
+plain `ContextualBandit`). SHA-256 is taken over canonical JSON of the whole
+record. The duplicated metadata columns must match the checksummed payload.
+
+### Safety
+
+- **Whitelisted fields only.** Every field is type- and range-checked on
+  restore, and configuration (strategies, epsilon, LinUCB dim/alpha/ridge,
+  fixed action, policy version) must equal the live policy. A checkpoint
+  restores learned estimates, counts and RNG state only. It cannot change
+  hyperparameters, reward weights, budgets, permissions or evaluation data,
+  even with a recomputed checksum (tested).
+- **Verify before change.** Corruption (checksum, truncated or non-canonical
+  JSON, unknown kind, edited columns, bad state fields, bad RNG state) raises
+  `CheckpointCorrupted`. The live policy and the store stay unchanged and a
+  `corruption_detected` event is logged.
+- **Atomic, logged rollback.** Status change, active pointer and the log row
+  are written in one SQLite transaction. The in-memory policy changes only
+  after commit. Tests inject a failure at the log write and at the pointer
+  update and check that nothing changed.
+- **Policy lines.** One store can hold several policies. Each checkpoint
+  belongs to the line `(kind, policy_version)`; the active pointer and "last
+  good" are per line, so a policy never rolls back onto another policy's
+  checkpoint (tested). Two live policies with the same kind and version need
+  separate stores.
+- **Last good.** Rollback targets the newest `good` checkpoint on the same
+  line that is older than the rejected one. A corrupt target is marked `corrupt` and skipped. If none
+  verifies, rollback fails closed (`NoGoodCheckpoint`). A rolled-back
+  checkpoint is never a target again.
+- **Idempotent restore.** Restoring twice gives the same state, and the next
+  decisions match the policy at save time (RNG restored). Tested for all five
+  policy kinds and after reopening the database.
+
+### Rollback trigger
+
+`admit_with_rollback(store, policy, skill_version=..., admit=..., validate=...)`:
+validate and save a `good` pre-admission checkpoint, call `admit(policy)`
+(returns the new skill version), validate again and save a `candidate`. Roll
+back if post-admission validation utility is strictly below the pre-admission
+checkpoint's recorded utility minus `ROLLBACK_MARGIN` (fixed at 0.02 utility,
+not a parameter), or on any critical violation even if utility rose.
+Otherwise promote the candidate. If `admit` or validation raises, the
+pre-admission checkpoint is restored before the error propagates. Validation
+gets a deep copy, so it never changes the live policy.
+
+`validation_utility(...)` is the standard `validate`: it loads only the
+`validation` split through `benchmark.load_benchmark` inside
+`optimisation_phase()` and runs the policy with learning off. Both entry
+points are in the guarded list in `tests/test_benchmark_integration.py`.
+
+### Limits
+
+- No candidate-admission gate exists yet (candidate-vs-baseline validation is
+  still open). The trigger is a callable the future admission step runs;
+  `admit` is supplied by the caller. The gate 5 registry (`registry.py`) is not
+  yet wired in: `skill_version` is a free string, not a registry candidate ID.
+- The skill version is an identifier only. Restore and rollback return it;
+  nothing deploys, rewrites or rolls back skill files.
+- Checkpoint status is lifecycle metadata outside the checksum. The checksum
+  detects corruption; it is not a signature.
+- All results in the tests are **synthetic** (hand-written benchmark, fake
+  executor). No live Hermes run.
 
 ## Sealed test evaluation (owner decision, 2026-11-22)
 
