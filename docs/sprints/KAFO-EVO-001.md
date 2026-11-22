@@ -115,7 +115,13 @@ Hermes improves on any real task.**
       tests showing the loop and `compare()` fail if they touch the sealed split.
       Limits: covers this Python process only, not subprocesses; directory listing
       of `sealed/` is not blocked.
-- [ ] Connect GEPA skill-candidate generation to the strategy registry.
+- [x] Connect GEPA skill-candidate generation to the strategy registry
+      (`evolution/adaptive/registry.py`, schema `candidate-registry/1`;
+      `evolution/adaptive/gepa_adapter.py` registers `evolve_skill` output as
+      `proposed` only, never admitted or deployed; only admitted candidates become
+      strategies, with toolsets inherited from a fixed base strategy. Tested on a
+      **stubbed GEPA output directory only; no live GEPA/LLM run**. Admission is
+      the next gate).
 - [ ] Require candidate-vs-baseline validation before candidate admission.
 - [ ] Implement policy/skill checkpoint and rollback.
 - [ ] Publish quality, utility, cost, latency, uncertainty and safety report.
