@@ -97,12 +97,24 @@ Hermes improves on any real task.**
 - [x] Build independent verifier with reproducible precision/recall scoring
       (`evolution/adaptive/verifier.py`, stdlib-only, no LLM judge; 61 unit
       tests on small synthetic inline fixtures, full suite 246 passed on
-      GitHub Actions. Not yet run on the gate 2 benchmark).
+      GitHub Actions. Run on the gate 2 benchmark via `evolution/adaptive/evaluation.py`:
+      a ground-truth review scores 1.0 and an empty review 0.0 (micro P/R/F1) on
+      train and validation; synthetic data, not a Hermes measurement).
 - [ ] Compare fixed, random, epsilon-greedy and LinUCB policies.
       Policies and harness delivered; compared on **synthetic data only**
       (see "Policy comparison (gate 4)"). Stays open until the comparison runs on
       the gate 2 benchmark with the gate 3 verifier.
-- [ ] Preserve train / validation / sealed test separation.
+- [x] Preserve train / validation / sealed test separation.
+      The adaptive loop (`core.choose_strategy`), its CLI (`cli.main`) and the
+      gate 4 harness (`compare.compare`) run inside `benchmark.optimisation_phase()`,
+      which blocks loading or opening the sealed split in-process (audit hook; also
+      through symlinks and dataset copies). `verifier.load_cases` refuses sealed
+      cases; only `evaluation.evaluate_sealed_test(final_evaluation=True)` unseals.
+      Tests: a static scan of `evolution/` (no benchmark path literals or loader
+      internals, no other unsealing, all three entry points guarded) and runtime
+      tests showing the loop and `compare()` fail if they touch the sealed split.
+      Limits: covers this Python process only, not subprocesses; directory listing
+      of `sealed/` is not blocked.
 - [ ] Connect GEPA skill-candidate generation to the strategy registry.
 - [ ] Require candidate-vs-baseline validation before candidate admission.
 - [ ] Implement policy/skill checkpoint and rollback.
@@ -254,6 +266,17 @@ measured against a baseline picked in hindsight on the same train data, so it
 does not show generalisation. Fixed-policy validation intervals have zero width
 because those runs are deterministic. **This is a hypothetical simulator: none
 of it is evidence about Hermes.**
+
+## Sealed test evaluation (owner decision, 2026-11-22)
+
+The verifier CLI (`python -m evolution.adaptive.verifier`) cannot score the
+sealed split: `load_cases` refuses sealed cases read from files. This is
+accepted. The final sealed evaluation will be a deliberate, logged,
+in-process step built for the report gate, through
+`evolution.adaptive.evaluation.evaluate_sealed_test(reviews, final_evaluation=True)`.
+That call loads the split with the integrity-checked loader, logs the
+unsealing, and refuses inside an optimisation phase. Its results must not feed
+back into optimisation or selection.
 
 ## Scientific acceptance criteria
 

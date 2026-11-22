@@ -23,8 +23,18 @@ Benchmark case schema (one JSON object per JSONL line)
 ``{case_id, split, language, code, context: {difficulty, domain},
 defects: [{defect_id, category, line_start, line_end, severity,
 description}]}``. Line numbers are 1-based and inclusive, and must fall
-inside ``code``. Cases are trusted evaluation data and are validated
-strictly: a malformed case raises ``ValueError``.
+inside ``code``; lines are counted on ``\n`` exactly as in
+``evolution.adaptive.benchmark.code_line_count``. Cases are trusted
+evaluation data and are validated strictly: a malformed case raises
+``ValueError``.
+
+Sealed split
+------------
+``load_cases`` (and so the CLI) refuses any case whose split is in
+``SEALED_SPLITS``: sealed test cases are never read from a file by the
+verifier. Final evaluation on the sealed split goes through
+``evolution.adaptive.evaluation.evaluate_sealed_test``, which loads it with
+the integrity-checked benchmark loader and passes the cases in memory.
 
 Review schema
 -------------
@@ -97,6 +107,8 @@ MATCH_RULE = "category-equal+line-overlap/1"
 DEFAULT_SEED = 0
 DEFAULT_BOOTSTRAP = 1000
 DEFAULT_CONFIDENCE = 0.95
+# Must equal evolution.adaptive.benchmark.SEALED_SPLITS (checked by tests).
+SEALED_SPLITS = ("test",)
 
 
 # ── Data types ─────────────────────────────────────────────────────────────
@@ -262,6 +274,13 @@ def _is_nonempty_str(value) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _line_count(code: str) -> int:
+    """Lines in code, counted on '\\n' (a final newline adds none)."""
+    if not code:
+        return 0
+    return code.count("\n") + (0 if code.endswith("\n") else 1)
+
+
 def _normalise(category: str) -> str:
     return "_".join(category.strip().lower().replace("-", " ").split())
 
@@ -290,7 +309,7 @@ def parse_case(raw: Mapping) -> BenchmarkCase:
                  f"context.{key} must be a nonempty string")
     raw_defects = raw.get("defects")
     _require(isinstance(raw_defects, list), where, "defects must be a list")
-    n_lines = len(code.splitlines())
+    n_lines = _line_count(code)
     defects, seen = [], set()
     for i, d in enumerate(raw_defects):
         dwhere = f"{where} defect[{i}]"
@@ -328,16 +347,25 @@ def parse_finding(raw) -> Finding | None:
 
 
 def load_cases(path: str | Path) -> list[BenchmarkCase]:
-    """Read benchmark cases from JSONL (read-only). case_ids must be unique."""
+    """Read open-split benchmark cases from JSONL (read-only).
+
+    case_ids must be unique; sealed-split cases raise PermissionError.
+    """
     cases = []
     with open(path, encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, 1):
             if not line.strip():
                 continue
             try:
-                cases.append(parse_case(json.loads(line)))
+                case = parse_case(json.loads(line))
             except (json.JSONDecodeError, ValueError) as exc:
                 raise ValueError(f"{path}:{lineno}: {exc}") from exc
+            if case.split in SEALED_SPLITS:
+                raise PermissionError(
+                    f"{path}:{lineno}: case {case.case_id!r} is in the sealed "
+                    f"{case.split!r} split; sealed cases are never read from files "
+                    "(use evolution.adaptive.evaluation.evaluate_sealed_test)")
+            cases.append(case)
     _check_unique([c.case_id for c in cases], "case_id")
     return cases
 

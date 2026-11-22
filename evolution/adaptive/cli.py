@@ -5,6 +5,7 @@ No API keys, Hermes installation, network, or GPU required.
 """
 import argparse
 import random
+from .benchmark import optimisation_phase
 from .core import ContextualBandit, ExperienceStore, Reward, choose_strategy
 
 STRATEGIES = ("direct", "structured", "tool_assisted")
@@ -40,7 +41,8 @@ def main() -> None:
         return Reward(result["quality"], result["cost"], result["time"])
 
     rewards = []
-    with ExperienceStore(args.db) as store:  # closed even if an episode raises
+    # The whole run is optimisation: the sealed benchmark split stays unreachable.
+    with optimisation_phase(), ExperienceStore(args.db) as store:
         for _ in range(args.episodes):
             context = rng.choice(CONTEXTS)
             record = choose_strategy(policy, context, executor, verifier, store,
