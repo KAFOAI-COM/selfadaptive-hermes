@@ -147,10 +147,13 @@ Hermes improves on any real task.**
 - [x] Implement policy/skill checkpoint and rollback.
       (`evolution/adaptive/checkpoint.py`, PR #9; 45 offline tests, full suite
       475 passed on GitHub Actions. See "Checkpoint and rollback (gate 7)".
-      Limits: the trigger wraps a caller-supplied `admit`, because the admission
-      gate (candidate-vs-baseline validation) is still open; skill rollback
-      restores the skill version ID only and is not yet wired to the gate 5
-      candidate registry. Synthetic data only.)
+      Wired into the real admission path: `admission.review_with_rollback`
+      checkpoints before `review_registered` admits, re-validates the admitted
+      candidate's catalogue strategy, and on a drop beyond `ROLLBACK_MARGIN` or a
+      critical violation retires it in the registry and rolls the checkpoint
+      store back, logging both (`tests/test_admission_rollback.py`, real registry
+      and admission, fake executor). Skill rollback = retire (terminal). Synthetic
+      data only; no live run of this path yet.)
 - [ ] Publish quality, utility, cost, latency, uncertainty and safety report.
 
 ## Hermes executor (gate 1)
@@ -394,14 +397,59 @@ gets a deep copy, so it never changes the live policy.
 `optimisation_phase()` and runs the policy with learning off. Both entry
 points are in the guarded list in `tests/test_benchmark_integration.py`.
 
+### Wiring into admission (gates 5 and 6)
+
+`admission.review_with_rollback(registry, candidate_id, base=..., make_executor=...,
+store=..., policy=...)` is the checkpointed admission path:
+
+1. Measure the parent (the active admitted skill) with
+   `admission.catalogue_validation`: the catalogue strategy
+   (`registry.candidate_strategy`) on the validation split, with the same
+   cases, seeds, references and scoring as `admit` (`ADMISSION_POLICY`).
+2. Save a `good` pre-admission checkpoint of the live selection policy whose
+   skill version is the parent's registry candidate ID.
+3. `review_registered(..., apply=True)` makes the gate 6 decision. A rejection
+   logs `admission_rejected` and nothing is rolled back.
+4. If admitted, measure the candidate's catalogue strategy the same way, save
+   a `candidate` checkpoint (skill version = the candidate ID) and apply
+   `rollback_decision` against the pre-admission checkpoint's recorded
+   utility. Pass: the checkpoint is promoted. Fail (drop beyond
+   `ROLLBACK_MARGIN` = 0.02, or any critical violation):
+   - the candidate is moved `admitted -> retired` in the registry, decided by
+     `admission-rollback:<policy sha>` with the pre/post utility, margin,
+     violation flag and checkpoint IDs as evidence; it leaves the catalogue;
+   - the checkpoint store rolls back atomically to the pre-admission
+     checkpoint, and the same details are written in its `rollback` row.
+5. If the post-admission check raises (for example unknown cost), the
+   candidate is retired and the pre-admission checkpoint restored before the
+   error propagates.
+
+`ROLLBACK_MARGIN` (0.02) is separate from the admission `min_margin` (0.05);
+`ADMISSION_POLICY` and its pinned SHA are unchanged. Only
+`review_registered` and `_retire_after_rollback` (to `retired` only) may
+call `registry.transition`; the static test pins both.
+
+Cost: the path adds a pre and a post validation pass (3 seeds x 10 cases =
+30 executor calls each) on top of admission's 60, so a live run of it costs
+about twice an admission review.
+
 ### Limits
 
-- No candidate-admission gate exists yet (candidate-vs-baseline validation is
-  still open). The trigger is a callable the future admission step runs;
-  `admit` is supplied by the caller. The gate 5 registry (`registry.py`) is not
-  yet wired in: `skill_version` is a free string, not a registry candidate ID.
-- The skill version is an identifier only. Restore and rollback return it;
-  nothing deploys, rewrites or rolls back skill files.
+- Skill rollback is **retire**, which is terminal in the gate 5 registry: the
+  same content cannot be proposed again. The parent stays admitted and is the
+  active skill again. Nothing deploys, rewrites or deletes skill files.
+- Registry and checkpoint store are separate SQLite databases, so the two
+  rollback writes are not one transaction. The order is fail-safe: retire
+  first, then roll the checkpoint back. A crash between the admission commit
+  and the post-admission check leaves the candidate admitted without that
+  check.
+- Admission does not change the selection policy, so restoring the policy
+  from the pre-admission checkpoint returns the same state. A policy rebuilt
+  over the enlarged catalogue is a different policy line and cannot be
+  restored from a pre-admission checkpoint.
+- With a deterministic fake executor the post-admission check reproduces the
+  admission result unless the catalogue run differs. The tests script that
+  difference; the trigger matters for live, nondeterministic runs.
 - Checkpoint status is lifecycle metadata outside the checksum. The checksum
   detects corruption; it is not a signature.
 - All results in the tests are **synthetic** (hand-written benchmark, fake

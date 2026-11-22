@@ -405,7 +405,9 @@ def _transition_calls(root: Path) -> list[str]:
 
 
 def test_only_the_admission_gate_changes_candidate_status():
-    assert _transition_calls(REPO) == ["evolution/adaptive/admission.py:review_registered"]
+    assert sorted(_transition_calls(REPO)) == [
+        "evolution/adaptive/admission.py:_retire_after_rollback",   # gate 7: to retired only
+        "evolution/adaptive/admission.py:review_registered"]
 
 
 def test_transition_scan_catches_other_callers(tmp_path):

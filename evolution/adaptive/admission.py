@@ -41,7 +41,7 @@ import logging
 import statistics
 from typing import Callable, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
-from . import evaluation, registry as reg, verifier
+from . import checkpoint as ck, evaluation, registry as reg, verifier
 from .benchmark import DEFAULT_VERSION, DEFECT_CATEGORIES, OPEN_SPLITS, optimisation_phase
 from .compare import bootstrap_ci
 from .core import Reward, score_outcome
@@ -330,7 +330,9 @@ def review_registered(registry: reg.CandidateRegistry, candidate_id: str, *,
     Provenance (GEPA's self-reported scores) is never read. Dry run by default;
     with ``apply=True`` the decision is recorded through ``registry.transition``
     as ``admitted`` or ``rejected`` (terminal), with the full decision as
-    evidence. This is the only package code allowed to call ``transition``.
+    evidence. Only this function and ``_retire_after_rollback`` (gate 7, to
+    ``retired`` only) may call ``transition``; a static test pins both.
+    Use :func:`review_with_rollback` for the checkpointed admission path.
     """
     entry = registry.get(candidate_id)
     if entry.status != reg.PROPOSED:
@@ -405,3 +407,145 @@ def admitted_catalogue(registry: reg.CandidateRegistry, skill_name: str,
         if errors:
             raise AdmissionEvidenceError(f"{entry.candidate_id}: " + "; ".join(errors))
     return reg.admitted_strategies(registry, skill_name, base)
+
+
+# ── Gate 7: checkpoint before admission, automatic rollback after ────────────
+
+ROLLBACK_DECIDED_BY = f"admission-rollback:{ADMISSION_POLICY.fingerprint()[:12]}"
+
+
+def catalogue_validation(registry: reg.CandidateRegistry, candidate_id: str, *,
+                         base: Strategy, make_executor: Callable[[int], Executor],
+                         ) -> ck.Validation:
+    """Validation-split utility of an ADMITTED candidate's catalogue strategy.
+
+    Same cases, seeds, references and scoring as ``admit`` (``ADMISSION_POLICY``),
+    but the strategy is the one the catalogue would serve
+    (``registry.candidate_strategy``), not the ``eval:`` arm. Used for both the
+    pre-admission (parent) and post-admission (new candidate) measurement, so
+    the two are comparable. Unknown cost raises instead of scoring as free.
+    """
+    with optimisation_phase():
+        policy = ADMISSION_POLICY
+        strategy = reg.candidate_strategy(registry, candidate_id, base)
+        cases = evaluation.open_cases((policy.split,),
+                                      version=policy.benchmark_version)[policy.split]
+        runs = _run_arm(ArmSpec(candidate_id, strategy), cases, make_executor, policy)
+        if any(r.utility is None for r in runs):
+            raise ValueError(f"{candidate_id}: unscorable runs (unknown cost)")
+        return ck.Validation(utility=statistics.fmean(r.utility for r in runs),
+                             critical_violation=any(r.violation for r in runs),
+                             n_tasks=len(runs), synthetic=True)
+
+
+@dataclass(frozen=True)
+class CheckpointedAdmission:
+    decision: AdmissionDecision
+    kept: bool                    # admitted by the gate and kept after the post check
+    rolled_back: bool             # admitted by the gate, then retired by the trigger
+    reason: str
+    active_skill: str             # registry candidate ID active after this call
+    pre_checkpoint: ck.Checkpoint
+    post_checkpoint: Optional[ck.Checkpoint]
+    pre_validation: ck.Validation
+    post_validation: Optional[ck.Validation]
+    synthetic: bool = True
+    notice: str = SYNTHETIC_NOTICE
+
+
+def _retire_after_rollback(registry: reg.CandidateRegistry, candidate_id: str, *,
+                           reason: str, evidence: Mapping) -> None:
+    """Gate 7 rollback of a skill: admitted -> retired (terminal). Nothing else."""
+    to_status = reg.RETIRED
+    assert to_status == reg.RETIRED
+    registry.transition(candidate_id, to_status, reason=reason,
+                        decided_by=ROLLBACK_DECIDED_BY, evidence=dict(evidence))
+    logger.warning("ROLLBACK %s retired: %s (synthetic)", candidate_id, reason)
+
+
+def review_with_rollback(registry: reg.CandidateRegistry, candidate_id: str, *,
+                         base: Strategy, make_executor: Callable[[int], Executor],
+                         store: ck.CheckpointStore, policy) -> CheckpointedAdmission:
+    """Checkpointed admission of a proposed registry candidate.
+
+    1. Measure the parent (active skill) with :func:`catalogue_validation` and
+       save a ``good`` pre-admission checkpoint of ``policy`` whose skill
+       version is the parent's candidate ID.
+    2. :func:`review_registered` with ``apply=True`` (the gate 6 decision).
+       A rejection is logged and nothing is rolled back.
+    3. If admitted, measure the new candidate the same way and save a
+       ``candidate`` checkpoint. ``checkpoint.rollback_decision`` against the
+       pre-admission checkpoint's recorded utility then either promotes it or
+       rolls back: the candidate is retired in the registry (removing it from
+       the catalogue) and the checkpoint store rolls back atomically to the
+       pre-admission checkpoint. Both are logged with the same evidence.
+
+    The registry and checkpoint store are separate databases, so the two
+    writes cannot share one transaction. The order is fail-safe: the candidate
+    is retired first. If the post-admission check raises, the candidate is
+    retired and the pre-admission checkpoint restored before the error
+    propagates, so an admitted candidate never stays without a passed check.
+    """
+    with optimisation_phase():
+        return _review_with_rollback(registry, candidate_id, base=base,
+                                     make_executor=make_executor, store=store, policy=policy)
+
+
+def _review_with_rollback(registry, candidate_id, *, base, make_executor, store, policy):
+    entry = registry.get(candidate_id)
+    if entry.status != reg.PROPOSED or not entry.parent_id:
+        raise ValueError(f"{candidate_id} must be a proposed candidate with a parent")
+    parent_id = entry.parent_id
+    label = f"admission:{candidate_id}"
+
+    pre_validation = catalogue_validation(registry, parent_id, base=base,
+                                          make_executor=make_executor)
+    pre = store.save(policy, skill_version=parent_id, label=f"{label}:pre",
+                     validation=pre_validation)
+    decision = review_registered(registry, candidate_id, base=base,
+                                 make_executor=make_executor, apply=True)
+    if not decision.admitted:
+        store.record_event("admission_rejected", checkpoint_id=pre.checkpoint_id,
+                           reason="; ".join(decision.reasons),
+                           details={"candidate_id": candidate_id, "parent_id": parent_id,
+                                    "policy_sha256": decision.policy_sha256})
+        return CheckpointedAdmission(decision, False, False, "rejected by admission gate",
+                                     parent_id, pre, None, pre_validation, None)
+
+    try:
+        post_validation = catalogue_validation(registry, candidate_id, base=base,
+                                               make_executor=make_executor)
+    except BaseException as exc:
+        why = f"post-admission validation failed: {type(exc).__name__}: {exc}"
+        _retire_after_rollback(registry, candidate_id, reason=why,
+                               evidence={"pre_checkpoint_id": pre.checkpoint_id,
+                                         "error_type": type(exc).__name__,
+                                         "synthetic": True})
+        store.restore(policy, pre.checkpoint_id, reason=why)
+        raise
+
+    post = store.save(policy, skill_version=candidate_id, label=f"{label}:post",
+                      status=ck.STATUS_CANDIDATE, validation=post_validation, activate=False)
+    pre_utility = store.load(pre.checkpoint_id).validation["utility"]
+    reason = ck.rollback_decision(pre_utility, post_validation)
+    details = {"candidate_id": candidate_id, "parent_id": parent_id,
+               "pre_checkpoint_id": pre.checkpoint_id,
+               "post_checkpoint_id": post.checkpoint_id,
+               "pre_utility": pre_utility, "post_utility": post_validation.utility,
+               "margin": ck.ROLLBACK_MARGIN,
+               "critical_violation": post_validation.critical_violation,
+               "admission_policy_sha256": decision.policy_sha256, "synthetic": True}
+    if reason is None:
+        store.promote(post.checkpoint_id, reason="post-admission validation passed",
+                      details=details)
+        return CheckpointedAdmission(decision, True, False, "admitted and kept",
+                                     candidate_id, pre, store.load(post.checkpoint_id),
+                                     pre_validation, post_validation)
+
+    _retire_after_rollback(registry, candidate_id,
+                           reason=f"post-admission rollback: {reason}", evidence=details)
+    active = store.rollback(policy, from_checkpoint_id=post.checkpoint_id,
+                            reason=reason, details=details)
+    return CheckpointedAdmission(decision, False, True, reason, active.skill_version, pre,
+                                 store.load(post.checkpoint_id), pre_validation,
+                                 post_validation)
