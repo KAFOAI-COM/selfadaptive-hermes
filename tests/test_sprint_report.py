@@ -286,3 +286,90 @@ def test_only_the_final_step_may_call_evaluate_sealed_test(tmp_path):
     assert len(problems) == 2 and all("evaluate_sealed_test" in p for p in problems)
     renamed = _scan(rogue, rel)   # right file, but helper() is not the allowed function
     assert len(renamed) == 1 and ":5:" in renamed[0]
+
+
+# ── Owner-decided live reviewer (tested with a fake executor only) ─────────
+
+from evolution.adaptive import admission as adm  # noqa: E402
+from evolution.adaptive.executor import FakeExecutor, FakeResponse, Strategy  # noqa: E402
+
+BASE = Strategy("reviewer")
+
+
+def test_executor_reviewer_records_skill_version_and_cost(tmp_path):
+    strategy = Strategy("reviewer:code-review@abc")
+    executor = FakeExecutor({}, default=FakeResponse(output="[]", cost_usd=0.01,
+                                                     latency_s=2.0))
+    reviewer = fe.ExecutorReviewer(executor, strategy, max_total_cost_usd=1.0)
+    record = fe.run_final_evaluation(reviewer, reviewer_id="fake:reviewer",
+                                     skill_version="code-review@abc", synthetic=True,
+                                     confirm=fe.CONFIRM_PHRASE,
+                                     ledger_path=tmp_path / "l.json", n_bootstrap=5)
+    rs = record["reviewer_summary"]
+    assert record["skill_version"] == "code-review@abc"
+    assert (rs["calls"], rs["total_cost_usd"], rs["stopped"]) == (10, 0.1, None)
+    assert rs["strategy_id"] == strategy.strategy_id and rs["backend"] == "fake"
+    assert all(task_id.startswith("pyrev-") for task_id, _ in executor.calls)
+    section = rp.final_evaluation_section(tmp_path / "l.json")
+    assert "cases" not in section["reviewer_summary"]
+    assert "skill version `code-review@abc`" in rp.format_markdown(
+        rp.generate(final_ledger_path=tmp_path / "l.json", **SMALL))
+
+
+def test_executor_reviewer_stops_spending_at_the_cap_and_survives_errors(tmp_path):
+    executor = FakeExecutor({}, default=FakeResponse(output="[]", cost_usd=0.3))
+    calls = {"n": 0}
+    original = executor.execute
+
+    def flaky(task, strategy):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient")
+        return original(task, strategy)
+    executor.execute = flaky
+    reviewer = fe.ExecutorReviewer(executor, Strategy("s"), max_total_cost_usd=0.5)
+    record = fe.run_final_evaluation(reviewer, reviewer_id="r", synthetic=True,
+                                     confirm=fe.CONFIRM_PHRASE,
+                                     ledger_path=tmp_path / "l.json", n_bootstrap=5)
+    rs = record["reviewer_summary"]
+    assert record["status"] == "completed"
+    assert (rs["exceptions"], rs["calls"], rs["skipped"]) == (1, 2, 7)
+    assert rs["total_cost_usd"] == 0.6 and "cost cap" in rs["stopped"]
+
+
+def test_unknown_cost_stops_spending(tmp_path):
+    executor = FakeExecutor({}, default=FakeResponse(output="[]", cost_usd=None))
+    reviewer = fe.ExecutorReviewer(executor, Strategy("s"), max_total_cost_usd=5.0)
+    fe.run_final_evaluation(reviewer, reviewer_id="r", synthetic=True,
+                            confirm=fe.CONFIRM_PHRASE, ledger_path=tmp_path / "l.json",
+                            n_bootstrap=5)
+    rs = reviewer.summary()
+    assert (rs["calls"], rs["skipped"]) == (1, 9) and "cost unknown" in rs["stopped"]
+
+
+def _admit_gepa(registry, validation, base, cand):
+    def make_executor(seed):
+        responses = {}
+        for case in validation:
+            truth = json.dumps(ev.ground_truth_findings(case))
+            for cid, out in ((cand.candidate_id, truth), (base.candidate_id, "[]")):
+                responses[(case.case_id, f"eval:reviewer:{cid}")] = FakeResponse(
+                    output=out, cost_usd=0.01, latency_s=2.0)
+        return FakeExecutor(responses)
+    return adm.review_registered(registry, cand.candidate_id, base=BASE,
+                                 make_executor=make_executor, apply=True)
+
+
+def test_select_final_skill_prefers_admitted_gepa_else_baseline(tmp_path):
+    validation = bm.load_split("validation")
+    with CandidateRegistry(tmp_path / "r.db") as registry:
+        base = registry.register_baseline("github-code-review", b"baseline skill\n")
+        cand = registry.propose("github-code-review", b"evolved skill\n",
+                                parent_id=base.candidate_id)
+        chosen, strategy = fe.select_final_skill(registry, "github-code-review", BASE)
+        assert chosen.candidate_id == base.candidate_id   # candidate only proposed
+        assert _admit_gepa(registry, validation, base, cand).admitted
+        chosen, strategy = fe.select_final_skill(registry, "github-code-review", BASE)
+        assert chosen.candidate_id == cand.candidate_id
+        assert strategy.strategy_id == f"reviewer:{cand.candidate_id}"
+        assert strategy.system_prompt == "evolved skill\n" and strategy.toolsets == ()
