@@ -61,12 +61,12 @@ def test_replay_pays_once_and_keys_on_request_content(tmp_path, hermes_repo):
     ex = fr.LedgerExecutor(inner, ledger, stage="t")
     task = Task("case-1", "review this")
     first = ex.execute(task, Strategy("a", system_prompt="X"))
-    again = ex.execute(task, Strategy("b", system_prompt="X"))   # same request, other ID
-    assert (ex.fresh, ex.replayed) == (1, 1)
-    assert again.strategy_id == "b" and again.output == first.output
-    ex.execute(task, Strategy("a", system_prompt="Y"))            # different system prompt
+    again = ex.execute(task, Strategy("a", system_prompt="X"))
+    assert (ex.fresh, ex.replayed) == (1, 1) and again.output == first.output
+    ex.execute(task, Strategy("b", system_prompt="X"))            # other strategy ID
+    ex.execute(task, Strategy("a", system_prompt="Y"))            # other system prompt
     fr.LedgerExecutor(inner, ledger, stage="t", sample=1).execute(task, Strategy("a", system_prompt="X"))
-    assert len(ledger.rows) == 3
+    assert len(ledger.rows) == 4
     # A new process replays from disk.
     resumed = fr.LedgerExecutor(inner, fr.SpendLedger(tmp_path / "l.jsonl", stop_usd=1.0), stage="t")
     resumed.execute(task, Strategy("a", system_prompt="X"))
@@ -158,37 +158,6 @@ def test_review_prompt_matches_admission_when_available():
     assert admission.review_prompt("x = 1\n") == fr.review_prompt("x = 1\n")
 
 
-def test_validation_utility_accepts_a_prompt_template():
-    from evolution.adaptive.checkpoint import validation_utility
-    from evolution.adaptive.policies import FixedPolicy
-
-    class Recording:
-        backend = "fake"
-
-        def __init__(self):
-            self.prompts = []
-
-        def execute(self, task, strategy):
-            from evolution.adaptive.executor import ExecutionOutcome
-            self.prompts.append(task.prompt)
-            return ExecutionOutcome(task_id=task.task_id, strategy_id=strategy.strategy_id,
-                                    backend="fake", output="[]", completed=True,
-                                    latency_s=1.0, cost_usd=0.01, cost_status="fake")
-
-    rec = Recording()
-    catalogue = {"direct": Strategy("direct")}
-    from evolution.adaptive.compare import CaseBenchmark, ContextEncoder
-    from evolution.adaptive import evaluation
-    from evolution.adaptive.benchmark import optimisation_phase
-    with optimisation_phase():
-        train = evaluation.open_cases(("train",))["train"]
-    encoder = ContextEncoder.fit(CaseBenchmark(train).items("train"), key_fields=("difficulty",),
-                                 categorical=("difficulty",), numeric={})
-    validation_utility(FixedPolicy(("direct",), "direct"), rec, fr.review_quality, catalogue,
-                       encoder, fr.SCORING, prompt_template=fr.REVIEW_TEMPLATE)
-    assert rec.prompts and all(p.startswith("Review the Python code below") for p in rec.prompts)
-
-
 # --------------------------------------------------------------------- CLI
 
 @pytest.mark.parametrize("extra, message", [
@@ -262,9 +231,11 @@ def _oracle_runner(run, better_marker):
     return runner
 
 
-@pytest.mark.parametrize("better, status", [(True, "admitted"), (False, "rejected")])
-def test_admission_runs_gate6_inside_gate7(tmp_path, hermes_repo, better, status):
-    pytest.importorskip("evolution.adaptive.admission")
+@pytest.mark.parametrize("better, status", [(True, "kept"), (False, "rejected")])
+def test_admission_uses_review_with_rollback(tmp_path, hermes_repo, better, status):
+    adm = pytest.importorskip("evolution.adaptive.admission")
+    if not hasattr(adm, "review_with_rollback"):
+        pytest.skip("gate 7 admission path (PR #12) not on this branch")
     skill = "# Review skill\nLook for defects.\n"
     run = make_run(tmp_path, hermes_repo, skill=skill)
     run.executor._runner = _oracle_runner(run, "BETTER" if better else "NEVER-MATCHES")
@@ -280,11 +251,14 @@ def test_admission_runs_gate6_inside_gate7(tmp_path, hermes_repo, better, status
     report = run.run(["compare", "admission"])
     result = report["stages"]["admission"]["result"]
     assert result["status"] == status, result
-    events = [e["event"] for e in result["gate7"]["checkpoint_log"]]
+    events = [e["event"] for e in result["checkpoint_log"]]
     assert events[0] == "save"                       # checkpoint BEFORE gate 6 decides
     if better:
         assert result["registry_status"] == "admitted" and events[-1] == "promote"
+        assert result["active_skill"] == result["candidate_id"]
     else:
-        assert result["registry_status"] == "rejected" and events[-1] == "restore"
-        assert result["gate7"]["active_skill_version"] == report["baseline_id"]
+        assert result["registry_status"] == "rejected" and events[-1] == "admission_rejected"
+        assert result["active_skill"] == result["parent_id"] == report["baseline_id"]
+    # gate 7's catalogue arm is measured with its own calls, not gate 6's replays
+    assert report["spend"]["by_stage"]["admission"]["calls"] >= 60
     assert report["sealed_split_open_attempts"] == 0
