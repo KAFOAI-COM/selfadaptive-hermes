@@ -30,10 +30,11 @@ def test_report_is_labelled_synthetic(small_report):
     assert md.splitlines()[2].startswith("> **SYNTHETIC RESULTS.")
     assert "Nothing in this report is evidence that Hermes improves" in small_report["notice"]
     assert "results from a hypothetical simulator, not from Hermes" in small_report["headline"][-1]
+    assert "evidence of real-world improvement" in small_report["headline"][-1]
     bare = rp.generate(final_ledger_path=REPO / "does-not-exist.json", live_smoke_path=None,
-                       **SMALL)
+                       live_run_path=None, **SMALL)
     assert bare["headline"][-1] == "These are results from a hypothetical simulator, not from Hermes."
-    assert bare["live_smoke"]["status"] == "pending"
+    assert bare["live_smoke"]["status"] == "pending" and bare["notice"] == rp.NOTICE
     assert "smoke" not in bare["notice"]
 
 
@@ -59,8 +60,8 @@ def test_headline_follows_the_verdicts(small_report):
 def test_full_report_states_no_improvement_over_best_fixed():
     """The committed report's headline comes from the gate 4 verdicts."""
     data = json.loads((rp.DEFAULT_OUT / "report.json").read_text(encoding="utf-8"))
-    assert data["headline"][0].startswith(
-        "No adaptive policy shows an improvement over the best fixed strategy")
+    assert any(h.startswith("Simulator: No adaptive policy shows an improvement over the best "
+                            "fixed strategy") for h in data["headline"])
     val = [c for c in data["policy_comparison"]["comparisons"]
            if c["baseline"] == data["policy_comparison"]["best_fixed_baseline"]
            and c["phase"] == "validation"]
@@ -86,11 +87,15 @@ def test_safety_section_and_pending_gates(small_report):
     from evolution.adaptive.admission import ADMISSION_POLICY
     assert safety["admission"]["status"] == "merged"
     assert safety["admission"]["policy_sha256"] == ADMISSION_POLICY.fingerprint()
-    assert safety["rollbacks"]["status"] == safety["registry"]["status"] == "not supplied"
-    assert "0 rollbacks is not a safety result" in safety["rollbacks"]["note"]
+    # registry and checkpoints come from the committed live-run snapshot by default
+    assert safety["rollbacks"]["status"] == safety["registry"]["status"] == "supplied"
+    bare = rp.generate(final_ledger_path=REPO / "nope.json", live_run_path=None, **SMALL)
+    assert bare["safety"]["rollbacks"]["status"] == bare["safety"]["registry"]["status"] \
+        == "not supplied"
+    assert "0 rollbacks is not a safety result" in bare["safety"]["rollbacks"]["note"]
     live = small_report["live_smoke"]
     assert live["label"] == "4 live cases; a smoke test, not a benchmark result"
-    assert "4-case Hermes smoke test" in small_report["notice"]
+    assert "4-case smoke test" in small_report["notice"]
     assert small_report["final_test_evaluation"]["status"] == "not run"
 
 
@@ -373,3 +378,102 @@ def test_select_final_skill_prefers_admitted_gepa_else_baseline(tmp_path):
         assert chosen.candidate_id == cand.candidate_id
         assert strategy.strategy_id == f"reviewer:{cand.candidate_id}"
         assert strategy.system_prompt == "evolved skill\n" and strategy.toolsets == ()
+
+
+# ── Live full run (live-1) snapshot ────────────────────────────────────────
+
+def test_live_run_snapshot_drives_the_report(small_report):
+    run = small_report["live_run"]
+    assert run["status"] == "supplied" and run["file"] == rp.DEFAULT_LIVE_RUN.name
+    assert run["sealed_split_open_attempts"] == 0 and run["splits_used"] == ["train",
+                                                                           "validation"]
+    reg = small_report["safety"]["registry"]
+    assert reg == run["registry"] and {c["source"] for c in reg["lineage"]} == {"baseline",
+                                                                                "gepa"}
+    kept = run["admission"]
+    assert kept["status"] == "kept" and kept["decision"]["admitted"] is True
+    assert any(c["registered_as"] == kept["candidate_id"] for c in run["gepa"]["candidates"])
+    assert set(run["source_files"]) >= {"state.json", "registry.sqlite", "checkpoints.sqlite"}
+    md = rp.format_markdown(small_report)
+    for text in ("## Live full run (live-1)", "### Live policy comparison",
+                 "### GEPA (gate 5 input)", "### Admission and checkpoint (gates 6 and 7)",
+                 "### Spend by stage", "not evidence of real-world improvement"):
+        assert text in md
+    head = small_report["headline"]
+    assert head[0].startswith("Live full run live-1")   # no final ledger in this report
+
+
+def test_committed_headline_leads_with_the_sealed_result():
+    data = json.loads((rp.DEFAULT_OUT / "report.json").read_text(encoding="utf-8"))
+    assert data["headline"][0].startswith("Pre-registered sealed final evaluation")
+    assert "STRICT micro-F1 +0.302 [0.157, 0.462]" in data["headline"][0]
+    assert "mostly precision" in data["headline"][0]
+    assert "used live Hermes" in data["notice"] and "real-world improvement" in data["notice"]
+
+
+def test_snapshot_is_aggregate_only_and_rebuildable(tmp_path):
+    """snapshot_live_run on a tiny fake run dir: read-only, no model outputs copied."""
+    from evolution.adaptive.checkpoint import CheckpointStore
+    from evolution.adaptive.core import ContextualBandit
+    run = tmp_path / "run-x"
+    (run / "gepa_log").mkdir(parents=True)
+    with CandidateRegistry(run / "registry.sqlite") as reg:
+        base = reg.register_baseline("code-review", b"base text\n")
+        cand = reg.propose("code-review", b"evolved text\n", parent_id=base.candidate_id)
+    with CheckpointStore(run / "checkpoints.sqlite") as store:
+        store.save(ContextualBandit(("a",), epsilon=0.1, seed=1), skill_version="s",
+                   label="pre")
+    secret = "MODEL-OUTPUT-SHOULD-NOT-BE-COPIED"
+    (run / "ledger.jsonl").write_text("\n".join(json.dumps(r) for r in [
+        {"stage": "compare", "cost_usd": 0.01, "latency_s": 2.0, "attempt": 0,
+         "output": secret},
+        {"stage": "compare", "cost_usd": None, "latency_s": 4.0, "attempt": 1,
+         "error": secret}]) + "\n", encoding="utf-8")
+    (run / "gepa_log/candidates.json").write_text(json.dumps(
+        [{"self": "base text"}, {"self": "evolved text"}]), encoding="utf-8")
+    (run / "gepa_log/run_log.json").write_text(json.dumps(
+        [{"i": 0, "selected_program_candidate": 0, "new_program_idx": 1}]), encoding="utf-8")
+    pol = {"validation": {k: {"mean": 0.5, "ci_low": 0.5, "ci_high": 0.5, "n": 1}
+                          for k in ("utility", "quality", "cost_usd", "latency_s")}}
+    validation = {"utility": 0.5, "n_tasks": 1, "critical_violation": False,
+                  "synthetic": True}
+    stages = {
+        "canary": {"status": "done", "seconds": 1.0, "result": {
+            "fresh_calls": 1, "replayed_calls": 0,
+            "cases": [{"case_id": "c1", "f1": 1.0, "cost_usd": 0.01, "parse_ok": True}]}},
+        "compare": {"status": "done", "seconds": 2.0, "result": {
+            "fresh_calls": 2, "replayed_calls": 0, "report": {
+                "best_fixed_baseline": "fixed:a", "executor_backend": "hermes",
+                "executions": 2, "policies": {"fixed:a": pol}, "comparisons": [],
+                "config": {"strategies": ["a"], "train_episodes": 1, "train_items": 1,
+                           "validation_items": 1, "validation_learning": False,
+                           "bootstrap": {"confidence": 0.95, "resamples": 10},
+                           "seeds": [0]}}}},
+        "gepa": {"status": "done", "seconds": 3.0, "result": {"metrics": {"seed": 0}}},
+        "admission": {"status": "done", "seconds": 4.0, "result": {
+            "status": "kept", "reason": "admitted and kept",
+            "candidate_id": cand.candidate_id, "parent_id": base.candidate_id,
+            "active_skill": cand.candidate_id, "registry_status": "proposed",
+            "decision": {"admitted": True, "case_ids": ["c1"]},
+            "pre_validation": validation, "post_validation": validation}}}
+    (run / "state.json").write_text(json.dumps({
+        "identity": {"model": "m"}, "baseline_id": base.candidate_id,
+        "sealed_split_open_attempts": 0, "stages": {}}), encoding="utf-8")
+    (run / "report.json").write_text(json.dumps({
+        "stages": stages, "skill_source": "s", "splits_used": ["train"]}), encoding="utf-8")
+    before = {p.name: p.read_bytes() for p in run.rglob("*") if p.is_file()}
+    snap = rp.snapshot_live_run(run)
+    assert {p.name: p.read_bytes() for p in run.rglob("*") if p.is_file()} == before
+    text = json.dumps(snap)
+    assert secret not in text and "case_ids" not in snap["admission"]["decision"]
+    st = snap["spend"]["by_stage"]["compare"]
+    assert (st["calls"], st["errors"], st["unknown_cost_calls"], st["retries"]) == (2, 1, 1, 1)
+    assert snap["gepa"]["candidates"][1] | {} == {
+        "index": 1, "chars": 12, "sha256": snap["gepa"]["candidates"][1]["sha256"],
+        "parent": 0, "merge": False, "seed": False, "registered_as": cand.candidate_id}
+    out = tmp_path / "snap.json"
+    out.write_text(json.dumps(snap), encoding="utf-8")
+    assert rp.live_run_section(str(out))["run_id"] == "run-x"
+    out.write_text(json.dumps({"schema": "other"}), encoding="utf-8")
+    with pytest.raises(ValueError):
+        rp.live_run_section(str(out))
