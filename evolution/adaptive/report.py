@@ -281,9 +281,14 @@ def final_evaluation_section(ledger_path: Path) -> dict:
         return {"status": "not run", "note": "the one-time final test evaluation has not "
                 "been run; when and on which reviewer is an owner decision"}
     record = json.loads(ledger_path.read_text(encoding="utf-8"))
-    keep = ("status", "started_at", "finished_at", "reviewer_id", "synthetic", "n_cases",
-            "totals", "micro", "macro", "benchmark", "verifier", "error")
-    return {k: record[k] for k in keep if k in record}
+    keep = ("status", "started_at", "finished_at", "reviewer_id", "skill_version",
+            "synthetic", "n_cases", "totals", "micro", "macro", "benchmark", "verifier",
+            "error")
+    out = {k: record[k] for k in keep if k in record}
+    summary = record.get("reviewer_summary")
+    if isinstance(summary, dict):
+        out["reviewer_summary"] = {k: v for k, v in summary.items() if k != "cases"}
+    return out
 
 
 def _rel(path: Path) -> str:
@@ -522,8 +527,17 @@ def format_markdown(report: Mapping) -> str:
               "second run.", ""]
     else:
         L += [f"Status **{fe['status']}**, started {fe.get('started_at')}, finished "
-              f"{fe.get('finished_at')}, reviewer `{fe.get('reviewer_id')}`, synthetic: "
-              f"{fe.get('synthetic')}."]
+              f"{fe.get('finished_at')}, reviewer `{fe.get('reviewer_id')}`, skill version "
+              f"`{fe.get('skill_version')}`, synthetic: {fe.get('synthetic')}."]
+        rs = fe.get("reviewer_summary")
+        if rs and "error" not in rs:
+            L += ["", f"Model `{rs.get('model')}` (provider `{rs.get('provider')}`), strategy "
+                  f"`{rs.get('strategy_id')}`. Cost USD {rs.get('total_cost_usd')} "
+                  f"(statuses {rs.get('cost_statuses')}, cap {rs.get('max_total_cost_usd')}). "
+                  f"Calls {rs.get('calls')}, completed {rs.get('completed')}, unparseable "
+                  f"{rs.get('unparseable')}, violations {rs.get('violations')}, exceptions "
+                  f"{rs.get('exceptions')}, skipped {rs.get('skipped')}"
+                  + (f", stopped: {rs['stopped']}" if rs.get("stopped") else "") + "."]
         if fe["status"] == "completed":
             L += ["", f"{fe['n_cases']} cases. Micro F1 {_iv(fe['micro']['f1'])}, micro "
                   f"precision {_iv(fe['micro']['precision'])}, micro recall "
