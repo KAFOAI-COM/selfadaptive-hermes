@@ -180,7 +180,7 @@ def test_bridge_kwargs_fix_isolation_switches():
 def test_bridge_summarise_result():
     result = {
         "final_response": "done", "completed": True, "failed": False, "partial": "no",
-        "api_calls": 2, "input_tokens": 10, "output_tokens": True,
+        "api_calls": 2, "input_tokens": 10, "output_tokens": True, "cache_read_tokens": 900,
         "estimated_cost_usd": math.nan, "cost_status": "estimated",
         "guardrail": {"action": "halt", "code": "loop", "tool_name": "x", "count": 3},
         "messages": [
@@ -194,6 +194,7 @@ def test_bridge_summarise_result():
     assert summary["tool_calls"] == ["todo_list", "terminal", "<unparseable>"]
     assert summary["estimated_cost_usd"] is None
     assert "partial" not in summary and "output_tokens" not in summary
+    assert summary["cache_read_tokens"] == 900
     assert summary["guardrail"] == {"action": "halt", "code": "loop", "tool_name": "x"}
     json.dumps(summary, allow_nan=False)
     with pytest.raises(TypeError):
@@ -274,13 +275,22 @@ def test_hermes_executor_is_off_by_default(fake_repo):
     assert calls == []
 
 
+def test_hermes_executor_requires_explicit_model(fake_repo):
+    calls = []
+    executor = HermesExecutor(hermes_repo=fake_repo, allow_live=True,
+                              runner=_runner_writing({}, calls))
+    with pytest.raises(ValueError, match="explicit model"):
+        executor.execute(TASK, PLAIN)
+    assert calls == []
+
+
 def test_hermes_executor_request_and_outcome(fake_repo):
     calls = []
     payload = {"ok": True, "final_response": "found 2 defects", "completed": True,
                "failed": False, "partial": False, "interrupted": False, "latency_s": 4.0,
                "estimated_cost_usd": 0.03, "cost_status": "estimated", "api_calls": 1,
                "input_tokens": 100, "output_tokens": 20, "total_tokens": 120,
-               "model": "m", "provider": "p", "tool_calls": []}
+               "model": "m", "provider": "p", "tool_calls": [], "cache_read_tokens": 950}
     budget = Budget(max_iterations=3, timeout_s=50, startup_grace_s=10)
     executor = HermesExecutor(hermes_repo=fake_repo, python="/hermes/python", budget=budget,
                               model="m", allow_live=True,
@@ -295,6 +305,7 @@ def test_hermes_executor_request_and_outcome(fake_repo):
         "found 2 defects", True, 0.03, 4.0)
     assert outcome.backend == "hermes" and not outcome.violation and outcome.error is None
     assert outcome.details["total_tokens"] == 120
+    assert outcome.details["cache_read_tokens"] == 950
 
 
 def test_hermes_executor_request_contents(fake_repo):
@@ -324,7 +335,7 @@ def test_hermes_executor_request_contents(fake_repo):
       "error": "hermes_error: ModuleNotFoundError: No module named 'openai'"}),
 ])
 def test_hermes_executor_outcome_mapping(fake_repo, payload, expect):
-    executor = HermesExecutor(hermes_repo=fake_repo, allow_live=True,
+    executor = HermesExecutor(hermes_repo=fake_repo, allow_live=True, model="m",
                               budget=Budget(max_cost_usd=1.0),
                               runner=_runner_writing(payload, []))
     outcome = executor.execute(TASK, PLAIN)
@@ -333,20 +344,21 @@ def test_hermes_executor_outcome_mapping(fake_repo, payload, expect):
 
 
 def test_hermes_executor_failures(fake_repo):
-    no_result = HermesExecutor(hermes_repo=fake_repo, allow_live=True,
+    no_result = HermesExecutor(hermes_repo=fake_repo, allow_live=True, model="m",
                                runner=_runner_writing(None, [], returncode=1, stderr="boom"))
     outcome = no_result.execute(TASK, PLAIN)
     assert outcome.error == "bridge_failed: exit 1: boom" and outcome.cost_usd is None
 
     def timeout_runner(argv, **kwargs):
         raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
-    timed_out = HermesExecutor(hermes_repo=fake_repo, allow_live=True, runner=timeout_runner,
+    timed_out = HermesExecutor(hermes_repo=fake_repo, allow_live=True, model="m", runner=timeout_runner,
                                budget=Budget(timeout_s=1, startup_grace_s=1))
     outcome = timed_out.execute(TASK, PLAIN)
     assert outcome.error == "timeout: killed after 2s" and not outcome.completed
 
     with pytest.raises(FileNotFoundError):
-        HermesExecutor(hermes_repo=fake_repo.parent / "missing", allow_live=True).execute(TASK, PLAIN)
+        HermesExecutor(hermes_repo=fake_repo.parent / "missing", allow_live=True,
+                       model="m").execute(TASK, PLAIN)
 
 
 def test_hermes_executor_real_subprocess_against_stub_checkout(tmp_path):
@@ -373,7 +385,7 @@ def test_hermes_executor_real_subprocess_against_stub_checkout(tmp_path):
             def close(self):
                 pass
     """))
-    executor = HermesExecutor(hermes_repo=repo, python=sys.executable, allow_live=True,
+    executor = HermesExecutor(hermes_repo=repo, python=sys.executable, allow_live=True, model="m",
                               budget=Budget(timeout_s=30, startup_grace_s=30))
     outcome = executor.execute(TASK, PLAIN)
     assert outcome.error is None, outcome.error
