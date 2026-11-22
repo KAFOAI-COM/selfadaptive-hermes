@@ -758,17 +758,21 @@ def _admit_with_rollback(store, policy, *, skill_version, admit, validate, label
 
 # ──────────────────────────────────────────────── validation-split utility
 
-def validation_utility(policy, executor, quality_fn, catalogue, encoder, scoring
-                       ) -> Validation:
+def validation_utility(policy, executor, quality_fn, catalogue, encoder, scoring, *,
+                       prompt_template: Optional[str] = None) -> Validation:
     """Mean utility and any critical violation of ``policy`` on the validation split.
 
     Loads only the ``validation`` split through ``benchmark.load_benchmark``
     inside ``optimisation_phase()``. Learning is off and a deep copy of the
     policy is used, so the live policy (including its RNG) is unchanged.
+    ``prompt_template`` (a ``str.format`` template with ``{code}``) overrides
+    ``CaseBenchmark``'s default review prompt, so validation can ask for the
+    same output format as the run that trained the policy.
     """
     with optimisation_phase():
         cases = load_benchmark(("validation",))["validation"]
-        bench = CaseBenchmark(cases)
+        bench = (CaseBenchmark(cases) if prompt_template is None
+                 else CaseBenchmark(cases, prompt_template=prompt_template))
         items = bench.items("validation")
         table = OutcomeTable(executor, catalogue, quality_fn, scoring)
         records = run_policy("validation", copy.deepcopy(policy), items, encoder, table,
