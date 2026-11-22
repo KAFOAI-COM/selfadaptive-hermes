@@ -119,8 +119,8 @@ Hermes improves on any real task.**
 - [ ] Connect GEPA skill-candidate generation to the strategy registry.
 - [ ] Require candidate-vs-baseline validation before candidate admission.
 - [x] Implement policy/skill checkpoint and rollback.
-      (`evolution/adaptive/checkpoint.py`, PR #9; 43 offline tests, full suite
-      473 passed on GitHub Actions. See "Checkpoint and rollback (gate 7)".
+      (`evolution/adaptive/checkpoint.py`, PR #9; 45 offline tests, full suite
+      475 passed on GitHub Actions. See "Checkpoint and rollback (gate 7)".
       Limits: the trigger wraps a caller-supplied `admit`, because the admission
       gates are still open; skill rollback restores the skill version ID only.
       Synthetic data only.)
@@ -305,8 +305,13 @@ record. The duplicated metadata columns must match the checksummed payload.
   are written in one SQLite transaction. The in-memory policy changes only
   after commit. Tests inject a failure at the log write and at the pointer
   update and check that nothing changed.
-- **Last good.** Rollback targets the newest `good` checkpoint older than the
-  rejected one. A corrupt target is marked `corrupt` and skipped. If none
+- **Policy lines.** One store can hold several policies. Each checkpoint
+  belongs to the line `(kind, policy_version)`; the active pointer and "last
+  good" are per line, so a policy never rolls back onto another policy's
+  checkpoint (tested). Two live policies with the same kind and version need
+  separate stores.
+- **Last good.** Rollback targets the newest `good` checkpoint on the same
+  line that is older than the rejected one. A corrupt target is marked `corrupt` and skipped. If none
   verifies, rollback fails closed (`NoGoodCheckpoint`). A rolled-back
   checkpoint is never a target again.
 - **Idempotent restore.** Restoring twice gives the same state, and the next

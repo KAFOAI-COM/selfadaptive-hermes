@@ -29,11 +29,17 @@ Safety properties:
 * **Fixed trigger.** ``rollback_decision`` rolls back when post-admission
   validation utility is strictly below the pre-admission checkpoint's utility
   minus ``ROLLBACK_MARGIN``, or when any critical violation occurs.
-* **Last good fallback.** Rollback targets the newest checkpoint with status
-  ``good`` older than the rejected one. If that checkpoint fails verification
-  it is marked ``corrupt`` and the next older good checkpoint is tried. If none
-  verifies, rollback fails closed: nothing changes and ``NoGoodCheckpoint``
-  is raised.
+* **Policy lines.** One store may hold checkpoints for several policies.
+  Each checkpoint belongs to the line ``(kind, policy_version)``; the active
+  pointer and "last good" are tracked per line, so one policy never rolls
+  back onto another's checkpoint. Two live policies with the same kind and
+  version must use separate stores.
+* **Last good fallback.** Rollback targets the newest ``good`` checkpoint on
+  the same line that is older than the rejected one. A target that fails
+  verification is marked ``corrupt`` and the next older one is tried. If none
+  verifies, rollback fails closed: the policy, the rejected checkpoint and the
+  active pointer are unchanged and ``NoGoodCheckpoint`` is raised (corrupt
+  targets found on the way stay marked ``corrupt``).
 
 The skill version is an identifier only. Restoring returns it to the caller;
 nothing here deploys or rewrites skills.
@@ -74,10 +80,6 @@ STATUS_CANDIDATE = "candidate"
 STATUS_ROLLED_BACK = "rolled_back"
 STATUS_CORRUPT = "corrupt"
 STATUSES = (STATUS_GOOD, STATUS_CANDIDATE, STATUS_ROLLED_BACK, STATUS_CORRUPT)
-
-SYNTHETIC_NOTICE = ("SYNTHETIC RESULTS: fake executor and/or hand-written benchmark. "
-                    "Not evidence that Hermes improves on any real task.")
-
 
 class CheckpointError(Exception):
     """Base class for checkpoint failures."""
@@ -371,10 +373,15 @@ _SCHEMA = (
         logged_at TEXT NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS checkpoint_active (
-        slot INTEGER PRIMARY KEY CHECK (slot = 0),
+        line TEXT PRIMARY KEY,
         checkpoint_id INTEGER NOT NULL
     )""",
 )
+
+
+def policy_line(kind: str, policy_version: str) -> str:
+    """Key of the checkpoint history a policy belongs to."""
+    return canonical_json([kind, policy_version])
 
 
 def _now() -> str:
@@ -423,10 +430,15 @@ class CheckpointStore:
         self.conn.execute("UPDATE policy_checkpoints SET status=? WHERE id=?",
                           (status, checkpoint_id))
 
-    def _set_active(self, checkpoint_id: int) -> None:
-        self.conn.execute("INSERT INTO checkpoint_active (slot, checkpoint_id) VALUES (0, ?) "
-                          "ON CONFLICT(slot) DO UPDATE SET checkpoint_id=excluded.checkpoint_id",
-                          (checkpoint_id,))
+    def _set_active(self, line: str, checkpoint_id: int) -> None:
+        self.conn.execute("INSERT INTO checkpoint_active (line, checkpoint_id) VALUES (?, ?) "
+                          "ON CONFLICT(line) DO UPDATE SET checkpoint_id=excluded.checkpoint_id",
+                          (line, checkpoint_id))
+
+    def _active(self, line: str) -> Optional[int]:
+        row = self.conn.execute("SELECT checkpoint_id FROM checkpoint_active WHERE line=?",
+                                (line,)).fetchone()
+        return None if row is None else row[0]
 
     def _log_corruption(self, checkpoint_id: int, error: Exception, *, mark: bool) -> None:
         logger.error("checkpoint %s failed verification: %s", checkpoint_id, error)
@@ -465,7 +477,7 @@ class CheckpointStore:
                  digest, status))
             checkpoint_id = cur.lastrowid
             if activate:
-                self._set_active(checkpoint_id)
+                self._set_active(policy_line(kind, policy.version), checkpoint_id)
             self._log("save", checkpoint_id, None, label,
                       {"seq": seq, "sha256": digest, "status": status, "activate": activate})
         return self.load(checkpoint_id)
@@ -510,10 +522,9 @@ class CheckpointStore:
         return Checkpoint(cid, seq, kind, policy_version, skill_version, label, created_at,
                           validation, doc["state"], digest, status)
 
-    def active_id(self) -> Optional[int]:
-        row = self.conn.execute(
-            "SELECT checkpoint_id FROM checkpoint_active WHERE slot=0").fetchone()
-        return None if row is None else row[0]
+    def active_id(self, policy) -> Optional[int]:
+        """Active checkpoint on ``policy``'s line, or None."""
+        return self._active(policy_line(_codec(policy)[0], policy.version))
 
     def log(self) -> list[dict]:
         cur = self.conn.execute(
@@ -542,9 +553,10 @@ class CheckpointStore:
         ckpt, apply = self._verified(policy, checkpoint_id, mark=False)
         if ckpt.status in (STATUS_ROLLED_BACK, STATUS_CORRUPT):
             raise CheckpointError(f"checkpoint {checkpoint_id} is {ckpt.status}")
+        line = policy_line(ckpt.kind, ckpt.policy_version)
         with self._transaction():
-            previous = self.active_id()
-            self._set_active(ckpt.checkpoint_id)
+            previous = self._active(line)
+            self._set_active(line, ckpt.checkpoint_id)
             self._log("restore", ckpt.checkpoint_id, previous, reason,
                       {"sha256": ckpt.sha256, "skill_version": ckpt.skill_version})
         apply()
@@ -555,16 +567,18 @@ class CheckpointStore:
         ckpt = self.load(checkpoint_id)
         if ckpt.status != STATUS_CANDIDATE:
             raise CheckpointError(f"checkpoint {checkpoint_id} is {ckpt.status}, not candidate")
+        line = policy_line(ckpt.kind, ckpt.policy_version)
         with self._transaction():
-            previous = self.active_id()
+            previous = self._active(line)
             self._set_status(checkpoint_id, STATUS_GOOD)
-            self._set_active(checkpoint_id)
+            self._set_active(line, checkpoint_id)
             self._log("promote", checkpoint_id, previous, reason, dict(details))
 
-    def last_good(self, *, before_seq: Optional[int] = None) -> list[int]:
-        """IDs of good checkpoints, newest first (optionally older than ``before_seq``)."""
-        sql = "SELECT id FROM policy_checkpoints WHERE status=?"
-        args: list = [STATUS_GOOD]
+    def last_good(self, kind: str, policy_version: str, *,
+                  before_seq: Optional[int] = None) -> list[int]:
+        """IDs of good checkpoints on one policy line, newest first."""
+        sql = "SELECT id FROM policy_checkpoints WHERE status=? AND kind=? AND policy_version=?"
+        args: list = [STATUS_GOOD, kind, policy_version]
         if before_seq is not None:
             sql += " AND seq < ?"
             args.append(before_seq)
@@ -572,22 +586,35 @@ class CheckpointStore:
 
     def rollback(self, policy, *, from_checkpoint_id: int, reason: str,
                  details: Mapping = ()) -> Checkpoint:
-        """Atomically roll back to the last good checkpoint older than the rejected one.
+        """Atomically roll back to the last good checkpoint on the same policy
+        line that is older than the rejected one.
 
         In one transaction: rejected checkpoint -> ``rolled_back``, active
         pointer -> target, ``rollback`` log row. The policy is updated only
-        after commit. Corrupt targets are marked ``corrupt`` and skipped; if no
-        target verifies, raises ``NoGoodCheckpoint`` and changes nothing else.
+        after commit. Corrupt targets are marked ``corrupt`` and skipped. If no
+        target verifies, raises ``NoGoodCheckpoint``; the policy, the rejected
+        checkpoint and the active pointer are unchanged.
         """
         rejected = self.load(from_checkpoint_id)
-        for target_id in self.last_good(before_seq=rejected.seq):
+        line = policy_line(rejected.kind, rejected.policy_version)
+        if line != policy_line(_codec(policy)[0], policy.version):
+            raise CheckpointMismatch(
+                f"checkpoint {from_checkpoint_id} belongs to another policy")
+        for target_id in self.last_good(rejected.kind, rejected.policy_version,
+                                        before_seq=rejected.seq):
             try:
                 target, apply = self._verified(policy, target_id, mark=True)
             except CheckpointCorrupted:
                 continue
+            except CheckpointMismatch as exc:
+                logger.error("checkpoint %s skipped: %s", target_id, exc)
+                with self._transaction():
+                    self._log("mismatch_skipped", target_id, rejected.checkpoint_id,
+                              str(exc), {})
+                continue
             with self._transaction():
                 self._set_status(rejected.checkpoint_id, STATUS_ROLLED_BACK)
-                self._set_active(target.checkpoint_id)
+                self._set_active(line, target.checkpoint_id)
                 self._log("rollback", target.checkpoint_id, rejected.checkpoint_id, reason,
                           {**dict(details), "to_sha256": target.sha256,
                            "to_skill_version": target.skill_version,

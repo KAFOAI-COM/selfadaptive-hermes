@@ -122,7 +122,7 @@ def test_restore_is_exact_and_idempotent(store, kind):
     # Restored RNG state: the next decisions match the policy at save time.
     assert future(policy) == future(reference)
     assert [e["event"] for e in store.log()] == ["save", "restore", "restore"]
-    assert store.active_id() == ckpt.checkpoint_id
+    assert store.active_id(policy) == ckpt.checkpoint_id
 
 
 @pytest.mark.parametrize("kind", ("epsilon-greedy", "linucb"))
@@ -308,7 +308,7 @@ def test_rollback_restores_last_good_and_logs(store):
     assert target.checkpoint_id == pre.checkpoint_id and target.skill_version == "skill/1"
     assert fingerprint(policy) == pre_print
     assert store.load(cand.checkpoint_id).status == ck.STATUS_ROLLED_BACK
-    assert store.active_id() == pre.checkpoint_id
+    assert store.active_id(policy) == pre.checkpoint_id
     entry = store.log()[-1]
     assert entry["event"] == "rollback" and entry["reason"] == "utility drop"
     assert (entry["checkpoint_id"], entry["from_checkpoint_id"]) == (pre.checkpoint_id,
@@ -321,7 +321,7 @@ def test_rollback_restores_last_good_and_logs(store):
     # A rolled-back checkpoint is never a restore or rollback target again.
     with pytest.raises(ck.CheckpointError):
         store.restore(policy, cand.checkpoint_id)
-    assert cand.checkpoint_id not in store.last_good()
+    assert cand.checkpoint_id not in store.last_good(cand.kind, cand.policy_version)
 
 
 def test_rollback_is_idempotent_in_effect(store):
@@ -329,7 +329,7 @@ def test_rollback_is_idempotent_in_effect(store):
     store.rollback(policy, from_checkpoint_id=cand.checkpoint_id, reason="r")
     store.rollback(policy, from_checkpoint_id=cand.checkpoint_id, reason="r")
     assert fingerprint(policy) == pre_print
-    assert store.active_id() == pre.checkpoint_id
+    assert store.active_id(policy) == pre.checkpoint_id
 
 
 @pytest.mark.parametrize("fail_on", ["rollback_log", "active_pointer"])
@@ -413,7 +413,7 @@ def test_admission_kept_when_validation_holds(store):
                                     admit=poison, validate=validate)
     assert result.admitted and result.skill_version == "skill/2"
     assert result.active_checkpoint.status == ck.STATUS_GOOD
-    assert store.active_id() == result.candidate_checkpoint.checkpoint_id
+    assert store.active_id(policy) == result.candidate_checkpoint.checkpoint_id
     assert all(p is not policy for p in validate.seen)  # validation used copies
     assert [e["event"] for e in store.log()][-1] == "promote"
     assert result.synthetic
@@ -428,7 +428,7 @@ def test_admission_rolled_back_on_drop_or_violation(store, post):
     assert not result.admitted
     assert result.skill_version == "skill/1"
     assert fingerprint(policy) == pre_print
-    assert store.active_id() == result.pre_checkpoint.checkpoint_id
+    assert store.active_id(policy) == result.pre_checkpoint.checkpoint_id
     assert result.candidate_checkpoint.status == ck.STATUS_ROLLED_BACK
     entry = store.log()[-1]
     details = json.loads(entry["details_json"])
@@ -536,3 +536,44 @@ def test_end_to_end_violating_admission_is_rolled_back(store, validation_cases):
     assert not result.admitted and result.skill_version == "skill/1"
     assert fingerprint(policy) == pre_print
     assert result.synthetic
+
+
+def test_policies_sharing_a_store_roll_back_to_their_own_checkpoints(store):
+    eg = train(build("epsilon-greedy"), 30)
+    eg_pre = store.save(eg, skill_version="skill/eg-1", label="eg pre")
+    eg_print = fingerprint(eg)
+    lin = train(build("linucb"), 30)
+    lin_pre = store.save(lin, skill_version="skill/lin-1", label="lin pre")  # newer
+    lin_print = fingerprint(lin)
+
+    train(eg, 20, start=30)
+    eg_cand = store.save(eg, skill_version="skill/eg-2", label="eg cand",
+                         status=ck.STATUS_CANDIDATE, activate=False)
+    target = store.rollback(eg, from_checkpoint_id=eg_cand.checkpoint_id, reason="drop")
+    assert target.checkpoint_id == eg_pre.checkpoint_id
+    assert fingerprint(eg) == eg_print
+    assert store.active_id(eg) == eg_pre.checkpoint_id
+    assert store.active_id(lin) == lin_pre.checkpoint_id      # other line untouched
+
+    train(lin, 20, start=30)
+    lin_cand = store.save(lin, skill_version="skill/lin-2", label="lin cand",
+                          status=ck.STATUS_CANDIDATE, activate=False)
+    assert store.rollback(lin, from_checkpoint_id=lin_cand.checkpoint_id,
+                          reason="drop").checkpoint_id == lin_pre.checkpoint_id
+    assert fingerprint(lin) == lin_print
+    assert store.active_id(eg) == eg_pre.checkpoint_id
+
+    with pytest.raises(ck.CheckpointMismatch):              # wrong policy for this line
+        store.rollback(eg, from_checkpoint_id=lin_cand.checkpoint_id, reason="r")
+
+
+def test_policy_without_own_good_checkpoint_fails_closed(store):
+    store.save(train(build("linucb"), 10), skill_version="s", label="other policy")
+    eg = train(build("epsilon-greedy"), 10)
+    cand = store.save(eg, skill_version="s2", label="cand", status=ck.STATUS_CANDIDATE,
+                      activate=False)
+    live = fingerprint(eg)
+    with pytest.raises(ck.NoGoodCheckpoint):
+        store.rollback(eg, from_checkpoint_id=cand.checkpoint_id, reason="r")
+    assert fingerprint(eg) == live
+    assert store.load(cand.checkpoint_id).status == ck.STATUS_CANDIDATE
