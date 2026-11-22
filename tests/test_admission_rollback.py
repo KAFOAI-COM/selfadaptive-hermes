@@ -251,3 +251,48 @@ def test_cannot_reach_held_out_split(registry, store, policy, pair, validation):
         bm.load_split("test", allow_sealed_test=True)
     with pytest.raises(bm.SealedSplitError):
         run(registry, store, policy, pair, validation, cat_base=misbehave)
+
+
+def test_rollback_path_stays_inside_optimisation_phase(registry, store, policy, pair,
+                                                       validation):
+    # Same scripted regression as above, so the post check and rollback both run.
+    phases = []
+    named = ids(pair)
+    make = factory(validation, {named["eval_cand"]: truth, named["cat_cand"]: "[]",
+                                named["cat_base"]: truth}, phases=phases)
+    attempts = bm.sealed_access_attempts()
+    result = adm.review_with_rollback(registry, pair[1].candidate_id, base=BASE,
+                                      make_executor=make, store=store, policy=policy)
+    assert result.rolled_back
+    assert phases and all(phases) and not bm.in_optimisation_phase()
+    assert bm.sealed_access_attempts() == attempts
+
+
+def test_sealed_access_during_post_check_retires_and_restores(registry, store, policy, pair,
+                                                              validation):
+    # Pre-admission check and admission run normally; only the served candidate
+    # strategy (used by the post-admission check) tries to load the sealed split.
+    named = ids(pair)
+    inner = factory(validation, {named["eval_cand"]: truth, named["cat_cand"]: truth})
+
+    def make_executor(seed):
+        executor = inner(seed)
+        original = executor.execute
+
+        def execute(task, strategy):
+            if strategy.strategy_id == named["cat_cand"]:
+                bm.load_split("test", allow_sealed_test=True)
+            return original(task, strategy)
+        executor.execute = execute
+        return executor
+
+    live = ck.canonical_json(ck.policy_state(policy))
+    with pytest.raises(bm.SealedSplitError):
+        adm.review_with_rollback(registry, pair[1].candidate_id, base=BASE,
+                                 make_executor=make_executor, store=store, policy=policy)
+    cand = pair[1].candidate_id
+    assert registry.get(cand).status == reg.RETIRED
+    assert registry.history(cand)[-1].decided_by == adm.ROLLBACK_DECIDED_BY
+    assert events(store)[-1] == "restore"
+    assert ck.canonical_json(ck.policy_state(policy)) == live
+    assert not bm.in_optimisation_phase()
