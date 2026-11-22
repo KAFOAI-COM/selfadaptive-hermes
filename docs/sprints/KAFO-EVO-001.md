@@ -88,7 +88,11 @@ Hermes improves on any real task.**
 - [x] Implement a Hermes executor adapter using an actually supported API
       (`AIAgent.run_conversation`, contract-checked against hermes-agent source;
       offline tests only — **no live Hermes/LLM run yet**, see "Hermes executor (gate 1)").
-- [ ] Build labelled Python-review benchmark with ground-truth defect IDs.
+- [x] Build labelled Python-review benchmark with ground-truth defect IDs.
+      (`datasets/python_review/v1`: 48 hand-written synthetic cases, 50 defects,
+      8 clean controls; train 28 / validation 10 / sealed test 10; SHA-256
+      manifest pinned in `evolution/adaptive/benchmark.py`. Labels are
+      single-author and not yet independently audited.)
 - [x] Build independent verifier with reproducible precision/recall scoring
       (`evolution/adaptive/verifier.py`, stdlib-only, no LLM judge; 61 unit
       tests on small synthetic inline fixtures, full suite 246 passed on
