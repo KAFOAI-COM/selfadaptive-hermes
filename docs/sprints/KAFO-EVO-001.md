@@ -10,7 +10,8 @@ Preserve the existing Nous Research GEPA skill evolution pipeline.
 
 - **Monitor:** capture task outcome, cost, time, external verifier result.
 - **Analyse:** identify quality, constraints and failure type.
-- **Plan:** contextual epsilon-greedy policy (first baseline).
+- **Plan:** contextual epsilon-greedy policy (first baseline); fixed, random
+  and LinUCB policies behind the same interface in `evolution/adaptive/policies.py`.
 - **Legitimise:** fixed reward calculation and critical-violation handling.
 - **Execute:** `evolution/adaptive/executor.py` — `Executor` protocol,
   `HermesExecutor` (documented Hermes Python API, opt-in) and deterministic
@@ -100,6 +101,9 @@ Hermes improves on any real task.**
       a ground-truth review scores 1.0 and an empty review 0.0 (micro P/R/F1) on
       train and validation; synthetic data, not a Hermes measurement).
 - [ ] Compare fixed, random, epsilon-greedy and LinUCB policies.
+      Policies and harness delivered; compared on **synthetic data only**
+      (see "Policy comparison (gate 4)"). Stays open until the comparison runs on
+      the gate 2 benchmark with the gate 3 verifier.
 - [ ] Preserve train / validation / sealed test separation.
       Done for merged code: the loop (`core.choose_strategy`, `cli`) runs inside
       `benchmark.optimisation_phase()`, which blocks loading or opening the sealed
@@ -172,6 +176,93 @@ an unknown cost is refused. `loop_executor(...)` plugs an executor into
 - `python` must be an interpreter that can import hermes-agent
   (`HERMES_PYTHON`); Hermes' launcher picks a PM-managed environment, so this
   is set by the operator.
+
+## Policy comparison (gate 4)
+
+### Policies (`evolution/adaptive/policies.py`)
+
+All implement `select(context) -> (strategy, propensity)`, `update(context,
+strategy, reward)` and `version`. A `Context` holds a discrete `key` and a
+numeric `features` vector, built only from task metadata visible before the
+decision.
+
+| Policy | Version string | Propensity |
+|---|---|---|
+| `FixedPolicy` | `fixed/1:<strategy>` | 1 |
+| `RandomPolicy` | `random/1` | 1/K |
+| `EpsilonGreedyPolicy` (wraps `core.ContextualBandit`, uses `key`) | `epsilon-greedy/1:eps=<e>` | as before |
+| `LinUCBPolicy` (disjoint LinUCB, Li et al. 2010, uses `features`) | `linucb/1:alpha=<a>,ridge=<r>` | 1, or 1/ties on exact ties |
+
+LinUCB is pure Python: `A^-1` is kept up to date with Sherman-Morrison, so
+no matrix library is needed. Being deterministic, it mostly logs propensity 1,
+which limits later off-policy evaluation of its logs.
+
+### Harness (`evolution/adaptive/compare.py`)
+
+- Same conditions for all policies: per seed, one task sequence (drawn from
+  train with a seeded RNG), the same executor and budget, and the same episode
+  count. Each (task, strategy) pair is executed and scored once and shared by
+  every policy, so all policies see identical outcomes.
+- Two phases: online learning on `train`, then one pass over `validation` with
+  learning off.
+- Metrics: utility (`core.score_outcome`, unchanged), quality, cost, latency,
+  violation rate, and regret against the per-task best strategy in hindsight.
+  Task-level noise is not predictable from the context, so regret cannot reach 0.
+- 95% percentile bootstrap CIs over seed-level means (seeded, 2000 resamples).
+  Each adaptive policy is compared with the best fixed policy (chosen by train
+  utility) and with random, using paired per-seed differences. Verdicts:
+  `improvement` (CI > 0), `worse` (CI < 0), `no improvement detected`.
+- Only `train` and `validation` are accepted. `test`, the sealed split and
+  unknown splits raise `SealedSplitRefused`. `CaseBenchmark` refuses to
+  construct if any case is outside those splits.
+- Every decision can be written to `ExperienceStore`, with its propensity and
+  policy version.
+- Results are labelled SYNTHETIC unless the benchmark is real and the executor
+  backend is `hermes`.
+
+Pluggable inputs, once the other gates merge:
+
+```python
+from evolution.adaptive.benchmark import load_split          # gate 2
+from evolution.adaptive.verifier import quality              # gate 3 (PR #2)
+from evolution.adaptive.executor import FakeExecutor, Strategy  # gate 1 (PR #3)
+bench = CaseBenchmark([*load_split("train"), *load_split("validation")])
+quality_fn = lambda item, outcome: quality(item.ground_truth, parse(outcome.output))
+```
+
+`parse` (model output to findings) is not defined yet. Tests for these three
+plug-ins are in `tests/test_policy_compare.py`. All three (executor #3,
+verifier #2, gate 2 benchmark #4) now run on the sprint branch and pass.
+
+### Synthetic result (2026-11-22)
+
+`python -m evolution.adaptive.compare --seeds 20 --train-episodes 300`
+(`synthetic-python-review/1`: 120 train / 60 validation tasks, scripted
+executor, invented success rates, costs and latencies in
+`evolution/adaptive/synthetic.py`). Mean utility, 95% CI:
+
+| Policy | Train utility | Validation utility |
+|---|---|---|
+| fixed:direct | 0.503 [0.492, 0.514] | 0.517 |
+| fixed:structured (best fixed) | 0.565 [0.554, 0.575] | 0.584 |
+| fixed:tool_assisted | 0.398 [0.384, 0.411] | 0.483 |
+| random | 0.489 [0.478, 0.500] | 0.538 [0.518, 0.560] |
+| epsilon_greedy | 0.590 [0.576, 0.604] | 0.579 [0.559, 0.598] |
+| linucb | 0.606 [0.592, 0.619] | 0.596 [0.576, 0.617] |
+
+Paired utility difference against the best fixed policy (`fixed:structured`):
+
+| Policy | Train | Validation |
+|---|---|---|
+| epsilon_greedy | +0.025 [+0.007, +0.043] improvement | -0.006 [-0.024, +0.014] **no improvement detected** |
+| linucb | +0.041 [+0.026, +0.056] improvement | +0.012 [-0.009, +0.033] **no improvement detected** |
+
+Both adaptive policies beat random in both phases. **On held-out validation,
+neither beats the best single fixed strategy.** The train-phase gain is
+measured against a baseline picked in hindsight on the same train data, so it
+does not show generalisation. Fixed-policy validation intervals have zero width
+because those runs are deterministic. **This is a hypothetical simulator: none
+of it is evidence about Hermes.**
 
 ## Scientific acceptance criteria
 
