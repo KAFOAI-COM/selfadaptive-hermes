@@ -85,7 +85,10 @@ Hermes improves on any real task.**
       (185 passed, Python 3.12 + dspy 3.5.0; Python 3.14 has no dspy install here).
 - [ ] Implement a Hermes executor adapter using an actually supported API.
 - [ ] Build labelled Python-review benchmark with ground-truth defect IDs.
-- [ ] Build independent verifier with reproducible precision/recall scoring.
+- [x] Build independent verifier with reproducible precision/recall scoring
+      (`evolution/adaptive/verifier.py`, stdlib-only, no LLM judge; 61 unit
+      tests on small synthetic inline fixtures, full suite 246 passed on
+      GitHub Actions. Not yet run on the gate 2 benchmark).
 - [ ] Compare fixed, random, epsilon-greedy and LinUCB policies.
 - [ ] Preserve train / validation / sealed test separation.
 - [ ] Connect GEPA skill-candidate generation to the strategy registry.
