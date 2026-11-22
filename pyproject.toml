@@ -41,3 +41,9 @@ include = ["evolution*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+
+[tool.uv]
+# darwinian-evolver is not published on PyPI (it is an external AGPL CLI per
+# PLAN.md), so uv cannot resolve the optional `darwinian` extra. Exclude it
+# from uv's resolution so `uv lock` succeeds; pip behaviour is unchanged.
+exclude-dependencies = ["darwinian-evolver"]

@@ -32,6 +32,8 @@ GEPA reads execution traces to understand *why* things fail (not just that they 
 git clone https://github.com/NousResearch/hermes-agent-self-evolution.git
 cd hermes-agent-self-evolution
 pip install -e ".[dev]"
+# or, for a pinned, hash-checked install from uv.lock:
+uv sync --frozen --extra dev
 
 # Point at your hermes-agent repo
 export HERMES_AGENT_REPO=~/.hermes/hermes-agent
