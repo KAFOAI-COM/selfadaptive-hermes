@@ -22,6 +22,19 @@ BASE = b"---\nname: code-review\ndescription: Review code\n---\n\nCheck for bugs
 EVOLVED = b"---\nname: code-review\ndescription: Review code\n---\n\nCheck bugs and leaks.\n"
 EVIDENCE = {"validation": "candidate beat baseline", "split": "validation"}
 
+# Importing the admission gate registers its policy fingerprint with the registry.
+from evolution.adaptive.admission import ADMISSION_POLICY  # noqa: E402
+
+
+def admitted_evidence(candidate_id):
+    """Minimal evidence shape the registry accepts for ``admitted`` (a gate 6 decision)."""
+    return {"admitted": True, "candidate_id": candidate_id,
+            "policy_sha256": ADMISSION_POLICY.fingerprint(), "reasons": []}
+
+
+def evidence_for(candidate_id, status):
+    return admitted_evidence(candidate_id) if status == ADMITTED else EVIDENCE
+
 
 @pytest.fixture
 def registry():
@@ -126,7 +139,7 @@ def test_symlinked_skill_file_refused(tmp_path):
 def test_evolving_an_admitted_candidate_uses_it_as_parent(registry, tmp_path):
     first = register_gepa_output(registry, gepa_dir(tmp_path, name="r1"))
     registry.transition(first.candidate_id, ADMITTED, reason="test", decided_by="test",
-                        evidence=EVIDENCE)
+                        evidence=admitted_evidence(first.candidate_id))
     second_body = EVOLVED + b"Also check types.\n"
     second = register_gepa_output(
         registry, gepa_dir(tmp_path, name="r2", baseline=EVOLVED, evolved=second_body))
@@ -164,7 +177,7 @@ def test_illegal_transitions_raise(registry, path):
     steps = {REJECTED: [REJECTED], ADMITTED: [ADMITTED], RETIRED: [ADMITTED, RETIRED]}
     for status in steps[path[0]]:
         registry.transition(cand.candidate_id, status, reason="r", decided_by="t",
-                            evidence=EVIDENCE)
+                            evidence=evidence_for(cand.candidate_id, status))
     with pytest.raises(TransitionError):
         registry.transition(cand.candidate_id, path[1], reason="r", decided_by="t",
                             evidence=EVIDENCE)
@@ -264,7 +277,7 @@ def test_only_admitted_candidates_become_strategies(registry):
     assert [s.strategy_id for s in admitted_strategies(registry, "code-review", parent)] == [
         f"structured:{base.candidate_id}"]
     registry.transition(cand.candidate_id, ADMITTED, reason="r", decided_by="t",
-                        evidence=EVIDENCE)
+                        evidence=admitted_evidence(cand.candidate_id))
     strategies = admitted_strategies(registry, "code-review", parent)
     assert [s.system_prompt for s in strategies] == [BASE.decode(), EVOLVED.decode()]
     assert all(s.toolsets == ("todo",) for s in strategies)
@@ -300,3 +313,82 @@ def test_adapter_has_no_path_to_admission():
     calls = {n.func.attr for n in ast.walk(tree)
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
     assert {"propose", "register_baseline"} <= calls
+
+
+# ── Admission requires a gate 6 decision (hardening, gate 6) ────────────────
+
+@pytest.mark.parametrize("make_evidence, match", [
+    (lambda cid: EVIDENCE, "admitted=true"),                       # arbitrary non-empty dict
+    (lambda cid: {"gepa_score": 0.99, "split": "validation"}, "admitted=true"),
+    (lambda cid: {**admitted_evidence(cid), "admitted": False}, "admitted=true"),
+    (lambda cid: {**admitted_evidence(cid), "admitted": "yes"}, "admitted=true"),
+    (lambda cid: {**admitted_evidence(cid), "policy_sha256": "0" * 64}, "registered"),
+    (lambda cid: {k: v for k, v in admitted_evidence(cid).items() if k != "policy_sha256"},
+     "registered"),
+    (lambda cid: {**admitted_evidence(cid), "candidate_id": "code-review@000000000000"},
+     "different candidate"),
+])
+def test_admission_rejects_evidence_that_is_not_a_gate6_decision(registry, make_evidence, match):
+    _, cand = _proposed(registry)
+    with pytest.raises(TransitionError, match=match):
+        registry.transition(cand.candidate_id, ADMITTED, reason="r", decided_by="t",
+                            evidence=make_evidence(cand.candidate_id))
+    assert registry.get(cand.candidate_id).status == PROPOSED
+    assert [t.to_status for t in registry.history(cand.candidate_id)] == [PROPOSED]
+
+
+def test_admission_accepts_a_gate6_decision(registry):
+    _, cand = _proposed(registry)
+    registry.transition(cand.candidate_id, ADMITTED, reason="r", decided_by="t",
+                        evidence=admitted_evidence(cand.candidate_id))
+    assert registry.get(cand.candidate_id).status == ADMITTED
+
+
+def test_nothing_can_be_admitted_without_a_registered_policy(registry, monkeypatch):
+    monkeypatch.setattr(reg, "_ADMISSION_POLICIES", set())
+    _, cand = _proposed(registry)
+    with pytest.raises(TransitionError, match="no admission policy"):
+        registry.transition(cand.candidate_id, ADMITTED, reason="r", decided_by="t",
+                            evidence=admitted_evidence(cand.candidate_id))
+    # Rejection needs no admission policy.
+    registry.transition(cand.candidate_id, REJECTED, reason="r", decided_by="t",
+                        evidence=EVIDENCE)
+
+
+def test_registered_policy_is_the_admission_gate_policy():
+    assert ADMISSION_POLICY.fingerprint() in reg.registered_admission_policies()
+    with pytest.raises(ValueError):
+        reg.register_admission_policy("not-a-sha")
+
+
+def test_registry_does_not_import_the_admission_gate():
+    _, names = _imports(reg)
+    assert not [n for n in names if "admission" in n], names
+
+
+# ── Evaluation-only strategies for proposed candidates ──────────────────────
+
+def test_evaluation_strategy_for_proposed_candidate_never_admits(registry):
+    base, cand = _proposed(registry)
+    parent = Strategy("structured", system_prompt="ignored", toolsets=("todo",))
+    strategy = reg.evaluation_strategy(registry, cand.candidate_id, parent)
+    assert strategy.strategy_id == f"eval:structured:{cand.candidate_id}"
+    assert strategy.system_prompt == EVOLVED.decode() and strategy.toolsets == ("todo",)
+    assert registry.get(cand.candidate_id).status == PROPOSED
+    assert len(registry.history(cand.candidate_id)) == 1
+    with pytest.raises(RegistryError, match="only admitted"):
+        candidate_strategy(registry, cand.candidate_id, parent)
+    assert all(not s.strategy_id.startswith("eval:")
+               for s in admitted_strategies(registry, "code-review", parent))
+    assert reg.evaluation_strategy(registry, base.candidate_id, parent).strategy_id \
+        == f"eval:structured:{base.candidate_id}"
+
+
+@pytest.mark.parametrize("status", [REJECTED, RETIRED])
+def test_evaluation_strategy_refuses_terminal_candidates(registry, status):
+    _, cand = _proposed(registry)
+    for step in ([REJECTED] if status == REJECTED else [ADMITTED, RETIRED]):
+        registry.transition(cand.candidate_id, step, reason="r", decided_by="t",
+                            evidence=evidence_for(cand.candidate_id, step))
+    with pytest.raises(RegistryError, match="can be evaluated"):
+        reg.evaluation_strategy(registry, cand.candidate_id, Strategy("structured"))

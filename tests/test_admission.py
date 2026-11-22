@@ -246,7 +246,7 @@ def registry_factory(validation, cand_id, base_id, cand_spec, base_spec="[]"):
         for case in validation:
             for cid, spec in ((cand_id, cand_spec), (base_id, base_spec)):
                 out = spec(case) if callable(spec) else spec
-                responses[(case.case_id, f"reviewer:{cid}")] = FakeResponse(
+                responses[(case.case_id, f"eval:reviewer:{cid}")] = FakeResponse(
                     output=out, cost_usd=0.01, latency_s=2.0)
         return FakeExecutor(responses)
     return make_executor
@@ -303,11 +303,22 @@ def test_gate_admitted_candidate_enters_the_catalogue(registry, validation, pair
     assert prompts == ["baseline skill\n", "evolved skill\n"]
 
 
-def test_admission_that_bypassed_the_gate_is_refused_by_the_catalogue(registry, pair):
-    registry.transition(pair[1].candidate_id, reg.ADMITTED, reason="looks good",
-                        decided_by="someone", evidence={"gepa_score": 0.99})
+def test_registry_refuses_arbitrary_admission_evidence(registry, pair):
+    with pytest.raises(reg.TransitionError):
+        registry.transition(pair[1].candidate_id, reg.ADMITTED, reason="looks good",
+                            decided_by="someone", evidence={"gepa_score": 0.99})
+    assert registry.get(pair[1].candidate_id).status == reg.PROPOSED
+
+
+def test_catalogue_refuses_minimal_evidence_not_made_by_the_gate(registry, pair):
+    # Shape the registry accepts, but not a full gate 6 decision: defence in depth.
+    registry.transition(pair[1].candidate_id, reg.ADMITTED, reason="manual",
+                        decided_by="someone",
+                        evidence={"admitted": True, "candidate_id": pair[1].candidate_id,
+                                  "policy_sha256": PINNED_POLICY_SHA256})
     errors = adm.admission_evidence_errors(registry, pair[1].candidate_id)
-    assert errors and any("accepted admission policy" in e for e in errors)
+    assert any("not the admission gate" in e for e in errors)
+    assert any("margin and CI" in e for e in errors)
     with pytest.raises(adm.AdmissionEvidenceError):
         adm.admitted_catalogue(registry, "code-review", BASE_STRATEGY)
 
@@ -327,11 +338,20 @@ def _forged(registry, validation, pair, **changes):
     return adm.admission_evidence_errors(registry, cand.candidate_id)
 
 
+@pytest.mark.parametrize("changes", [
+    {"evidence": {"candidate_id": "code-review@000000000000"}},
+    {"evidence": {"admitted": False}},
+    {"evidence": {"policy_sha256": "0" * 64}},
+])
+def test_registry_refuses_edited_decisions(registry, validation, pair, changes):
+    with pytest.raises(reg.TransitionError):
+        _forged(registry, validation, pair, **changes)
+    assert registry.get(pair[1].candidate_id).status == reg.PROPOSED
+
+
 @pytest.mark.parametrize("changes, expected", [
     ({}, None),   # a genuine decision recorded by hand is accepted
     ({"decided_by": "someone"}, "not the admission gate"),
-    ({"evidence": {"candidate_id": "code-review@000000000000"}}, "different candidate"),
-    ({"evidence": {"admitted": False}}, "not an admission decision"),
     ({"evidence": {"candidate_violations": 2}}, "violations"),
     ({"evidence": {"ci_low": -0.1}}, "margin and CI"),
     ({"evidence": {"policy": {**ADMISSION_POLICY.to_dict(), "min_margin": 0.0001}}},
@@ -350,7 +370,8 @@ def test_evaluation_arm_takes_tools_from_base_only(registry, pair):
     arm = adm.evaluation_arm(registry, pair[1].candidate_id, base)
     assert arm.strategy.system_prompt == "evolved skill\n"
     assert arm.strategy.toolsets == ("todo",)
-    assert arm.strategy.strategy_id == f"reviewer:{pair[1].candidate_id}"
+    assert arm.strategy.strategy_id == f"eval:reviewer:{pair[1].candidate_id}"
+    assert registry.get(pair[1].candidate_id).status == reg.PROPOSED
 
 
 def test_review_refuses_wrong_states(registry, validation, pair):
@@ -393,3 +414,16 @@ def test_transition_scan_catches_other_callers(tmp_path):
     sneaky.write_text("def promote(r, cid):\n    r.transition(cid, 'admitted', reason='x',"
                       " decided_by='x', evidence={'ok': 1})\n", encoding="utf-8")
     assert _transition_calls(tmp_path) == ["evolution/adaptive/sneaky.py:promote"]
+
+
+def test_only_the_admission_gate_registers_admission_policies():
+    callers = []
+    for path in sorted((REPO / "evolution").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "attr", getattr(node.func, "id", None))
+                if name == "register_admission_policy":
+                    callers.append(path.relative_to(REPO).as_posix())
+    assert callers == ["evolution/adaptive/admission.py"]
+    assert reg.registered_admission_policies() == adm.ACCEPTED_POLICY_SHA256

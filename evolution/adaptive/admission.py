@@ -296,6 +296,8 @@ def _admit(candidate, baseline, make_executor, policy: AdmissionPolicy) -> Admis
 # superseded policy here (in reviewed code) when ADMISSION_POLICY changes, so
 # candidates admitted under it stay valid.
 ACCEPTED_POLICY_SHA256 = frozenset({ADMISSION_POLICY.fingerprint()})
+for _fingerprint in sorted(ACCEPTED_POLICY_SHA256):
+    reg.register_admission_policy(_fingerprint)   # registry refuses other admissions
 
 
 class AdmissionEvidenceError(reg.RegistryError):
@@ -308,20 +310,15 @@ def _decided_by(policy_sha256: str) -> str:
 
 def evaluation_arm(registry: reg.CandidateRegistry, candidate_id: str,
                    base: Strategy) -> ArmSpec:
-    """Arm for a registry entry, for evaluation only.
+    """Arm for a registry entry, built with ``registry.evaluation_strategy``.
 
-    Same rule as ``registry.candidate_strategy``: the skill text becomes the
-    system prompt and toolsets come from ``base``, so a candidate cannot change
-    tools. Unlike ``candidate_strategy`` it accepts a ``proposed`` candidate,
-    because admission must run it before it is admitted.
+    Evaluation only: tools come from ``base``, the strategy ID is prefixed
+    ``eval:``, and no status changes.
     """
     if not isinstance(base, Strategy):
         raise TypeError("base must be an executor.Strategy")
-    entry = registry.get(candidate_id)
-    text = registry.content(candidate_id).decode("utf-8")   # hash re-checked by the registry
-    return ArmSpec(entry.candidate_id,
-                   Strategy(strategy_id=f"{base.strategy_id}:{entry.candidate_id}",
-                            system_prompt=text, toolsets=base.toolsets))
+    return ArmSpec(registry.get(candidate_id).candidate_id,
+                   reg.evaluation_strategy(registry, candidate_id, base))
 
 
 def review_registered(registry: reg.CandidateRegistry, candidate_id: str, *,

@@ -132,13 +132,18 @@ Hermes improves on any real task.**
       logs every failed rule. Thresholds are a frozen `ADMISSION_POLICY`, not
       arguments of `admit()`; its SHA-256 is pinned in tests and recorded in every
       decision. `review_registered` reviews a proposed gate 5 candidate against its
-      parent and records the decision via `registry.transition` (GEPA provenance is
-      never read). Required by: (1) a static scan, under which no package code
-      except `review_registered` may call `transition`; (2) `admitted_catalogue`
-      refuses any admitted non-baseline candidate whose admission evidence is not
-      a valid gate 6 decision (accepted policy hash, `decided_by`, matching IDs,
-      rules met). Limit: the check validates the evidence, not who wrote it, so a
-      person with direct registry access could copy a genuine decision.
+      parent, using the evaluation-only `registry.evaluation_strategy` (`eval:` IDs,
+      tools from base, no status change), and records the decision via
+      `registry.transition` (GEPA provenance is never read). Required by:
+      (1) `CandidateRegistry.transition(..., "admitted")` accepts only evidence with
+      `admitted=true`, the same `candidate_id`, and a `policy_sha256` registered by
+      `admission` at import (`register_admission_policy`). With nothing registered,
+      nothing can be admitted, and the registry does not import scoring code.
+      (2) Static scans: only `review_registered` calls `transition`, and only
+      `admission` registers policies. (3) `admitted_catalogue` re-checks the full
+      decision (`decided_by`, margin, CI, violations). Limit: these checks validate
+      the evidence, not who wrote it, so a person with direct registry or database
+      access could still copy a genuine decision.
 - [x] Implement policy/skill checkpoint and rollback.
       (`evolution/adaptive/checkpoint.py`, PR #9; 45 offline tests, full suite
       475 passed on GitHub Actions. See "Checkpoint and rollback (gate 7)".
