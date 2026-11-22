@@ -335,3 +335,134 @@ def test_scanner_catches_direct_reads(tmp_path):
     assert any("path literal" in p for p in problems)
     assert any("imports benchmark internal BENCHMARK_ROOT" in p for p in problems)
     assert any("allow_sealed_test" in p for p in problems)
+
+
+# ── Gate 4 harness: compare() runs inside the optimisation phase ─────────────
+
+from evolution.adaptive.compare import CaseBenchmark, ContextEncoder, compare, default_policy_specs  # noqa: E402
+from evolution.adaptive.synthetic import REFERENCE_SCORING, STRATEGIES  # noqa: E402
+
+
+def _compare_over_open_splits(open_benchmark, misbehave=None, seen_phase=None):
+    cases = list(open_benchmark["train"]) + list(open_benchmark["validation"])
+    bench = CaseBenchmark(cases)
+    responses = {}
+    for case in cases:
+        for strategy in STRATEGIES:
+            findings = ev.ground_truth_findings(case) if strategy == "structured" else []
+            responses[(case.case_id, strategy)] = FakeResponse(
+                output=json.dumps(findings), cost_usd=0.02, latency_s=3.0)
+    vcases = {c.case_id: ev.to_verifier_case(c) for c in cases}
+
+    def quality_fn(item, outcome):
+        if seen_phase is not None:
+            seen_phase.append(bm.in_optimisation_phase())
+        if misbehave:
+            misbehave()
+        return v.quality(vcases[item.task_id], json.loads(outcome.output))
+
+    encoder = ContextEncoder.fit(bench.items("train"), key_fields=("difficulty",),
+                                 categorical=("difficulty",), numeric={"n_lines": 100.0})
+    return compare(bench, FakeExecutor(responses), quality_fn,
+                   {s: Strategy(s) for s in STRATEGIES}, encoder,
+                   default_policy_specs(STRATEGIES, encoder.dim),
+                   seeds=[0], train_episodes=20, scoring=REFERENCE_SCORING, n_resamples=20)
+
+
+def test_compare_runs_inside_optimisation_phase_and_never_opens_sealed(
+        opened_files, open_benchmark):
+    seen = []
+    result = _compare_over_open_splits(open_benchmark, seen_phase=seen)
+    assert result.report["policies"]
+    assert seen and all(seen)
+    assert not bm.in_optimisation_phase()
+    assert _touches_sealed(opened_files) == []
+
+
+@pytest.mark.parametrize("attack", ["open_file", "unseal_loader", "final_evaluation"])
+def test_compare_fails_if_it_touches_sealed_split(open_benchmark, attack):
+    def misbehave():
+        if attack == "open_file":
+            SEALED_FILE.read_bytes()
+        elif attack == "unseal_loader":
+            bm.load_split("test", allow_sealed_test=True)
+        else:
+            ev.evaluate_sealed_test({}, final_evaluation=True)
+    with pytest.raises(bm.SealedSplitError):
+        _compare_over_open_splits(open_benchmark, misbehave=misbehave)
+
+
+# Optimisation entry points that must run their body inside optimisation_phase().
+_GUARDED_ENTRY_POINTS = {
+    Path("evolution/adaptive/core.py"): "choose_strategy",
+    Path("evolution/adaptive/cli.py"): "main",
+    Path("evolution/adaptive/compare.py"): "compare",
+}
+
+
+def _is_phase_call(expr) -> bool:
+    func = expr.func if isinstance(expr, ast.Call) else None
+    return (isinstance(func, ast.Name) and func.id == "optimisation_phase") or \
+           (isinstance(func, ast.Attribute) and func.attr == "optimisation_phase")
+
+
+def unguarded_entry_points(root: Path) -> list[str]:
+    problems = []
+    for rel, name in _GUARDED_ENTRY_POINTS.items():
+        path = root / rel
+        if not path.exists():
+            problems.append(f"{rel}: missing")
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name]
+        if len(funcs) != 1:
+            problems.append(f"{rel}: expected one top-level {name}()")
+            continue
+        guarded = any(isinstance(stmt, ast.With) and any(_is_phase_call(i.context_expr)
+                                                         for i in stmt.items)
+                      for stmt in funcs[0].body)
+        if not guarded:
+            problems.append(f"{rel}:{name}() does not run inside optimisation_phase()")
+    return problems
+
+
+def test_loop_cli_and_compare_entry_points_are_guarded():
+    assert unguarded_entry_points(REPO) == []
+
+
+def test_entry_point_check_catches_an_unguarded_compare(tmp_path):
+    for rel in _GUARDED_ENTRY_POINTS:
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(REPO / rel, target)
+    (tmp_path / "evolution/adaptive/compare.py").write_text(
+        "def compare(*args, **kwargs):\n    return _compare(*args, **kwargs)\n",
+        encoding="utf-8")
+    assert unguarded_entry_points(tmp_path) == [
+        "evolution/adaptive/compare.py:compare() does not run inside optimisation_phase()"]
+
+
+# ── Clean controls cannot inflate scores ─────────────────────────────────────
+
+@pytest.mark.parametrize("split", bm.OPEN_SPLITS)
+def test_false_finding_on_clean_control_scores_zero(split, open_benchmark):
+    cases = open_benchmark[split]
+    clean = [c for c in cases if c.is_clean]
+    assert clean
+    false_finding = [{"line_start": 1, "line_end": 1, "category": "logic_error"}]
+
+    only_clean = ev.evaluate_open({c.case_id: false_finding for c in clean},
+                                  splits=(split,), n_bootstrap=20)[split]
+    by_id = {r.case_id: r for r in only_clean.cases}
+    for case in clean:
+        result = by_id[case.case_id]
+        assert (result.true_positives, result.false_positives) == (0, 1)
+        assert result.precision == result.recall == result.f1 == result.quality == 0.0
+
+    perfect = {c.case_id: ev.ground_truth_findings(c) for c in cases}
+    noisy = dict(perfect, **{c.case_id: false_finding for c in clean})
+    best = ev.evaluate_open(perfect, splits=(split,), n_bootstrap=20)[split]
+    worse = ev.evaluate_open(noisy, splits=(split,), n_bootstrap=20)[split]
+    assert best.micro.precision.point == best.macro.f1.point == 1.0
+    assert worse.micro.precision.point < 1.0
+    assert worse.macro.f1.point == pytest.approx(1 - len(clean) / len(cases))

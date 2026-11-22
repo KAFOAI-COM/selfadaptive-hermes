@@ -40,6 +40,7 @@ import sys
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
+from .benchmark import optimisation_phase
 from .core import ExperienceStore, Reward, score_outcome
 from .policies import (
     Context, EpsilonGreedyPolicy, FixedPolicy, LinUCBPolicy, Policy, RandomPolicy,
@@ -373,6 +374,27 @@ class ComparisonResult:
 
 
 def compare(benchmark: Benchmark, executor, quality_fn: QualityFn,
+            catalogue: Mapping[str, Any], encoder: ContextEncoder,
+            specs: Sequence[PolicySpec], *, seeds: Sequence[int], train_episodes: int,
+            scoring: Scoring, oracle: bool = True, n_resamples: int = 2000,
+            confidence: float = 0.95, bootstrap_seed: int = 0,
+            store: Optional[ExperienceStore] = None,
+            skill_version: str = "catalogue/unversioned") -> ComparisonResult:
+    """Run every policy on identical task sequences per seed; train online, then
+    evaluate the trained policy (no further learning) on the validation split.
+
+    Runs inside ``benchmark.optimisation_phase()``: nothing called from here
+    (benchmark, executor, quality function) can load or open the sealed split.
+    """
+    with optimisation_phase():
+        return _compare(benchmark, executor, quality_fn, catalogue, encoder, specs,
+                        seeds=seeds, train_episodes=train_episodes, scoring=scoring,
+                        oracle=oracle, n_resamples=n_resamples, confidence=confidence,
+                        bootstrap_seed=bootstrap_seed, store=store,
+                        skill_version=skill_version)
+
+
+def _compare(benchmark: Benchmark, executor, quality_fn: QualityFn,
             catalogue: Mapping[str, Any], encoder: ContextEncoder,
             specs: Sequence[PolicySpec], *, seeds: Sequence[int], train_episodes: int,
             scoring: Scoring, oracle: bool = True, n_resamples: int = 2000,
