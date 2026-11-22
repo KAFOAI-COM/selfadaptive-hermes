@@ -292,3 +292,38 @@ def test_only_the_paired_step_may_call_sealed_test_cases(tmp_path):
     assert len(_scan(rogue, Path("evolution/adaptive/rogue.py"))) == 2
     renamed = _scan(rogue, rel)
     assert len(renamed) == 1 and ":5:" in renamed[0] and "sealed_test_cases" in renamed[0]
+
+
+def test_committed_ledger_keeps_no_free_text_from_the_reviewer(tmp_path):
+    secret = "ECHOED-SEALED-TEXT"
+    exec_b = FakeExecutor({}, default=FakeResponse(output="not json", cost_usd=0.01,
+                                                   error=f"agent said {secret}"))
+    exec_c = FakeExecutor({}, default=FakeResponse(output="[]", cost_usd=0.01))
+    original = exec_c.execute
+
+    def flaky(task, strategy):
+        if len(exec_c.calls) == 0:
+            exec_c.calls.append((task.task_id, strategy.strategy_id))
+            raise RuntimeError(f"crash quoting {secret}")
+        return original(task, strategy)
+    exec_c.execute = flaky
+    meter = fe.CostMeter(2.0)
+    _run(tmp_path, {"baseline": fe.ExecutorReviewer(exec_b, Strategy("review:b"), meter=meter),
+                    "candidate": fe.ExecutorReviewer(exec_c, Strategy("review:c"), meter=meter)})
+    text = (tmp_path / "final.json").read_text(encoding="utf-8")
+    assert secret not in text
+    record = json.loads(text)
+    rows_b = record["reviewer_summaries"]["baseline"]["cases"]
+    rows_c = record["reviewer_summaries"]["candidate"]["cases"]
+    assert all(r["error"] is True and r["parse_ok"] is False for r in rows_b)
+    assert [r.get("exception_type") for r in rows_c].count("RuntimeError") == 1
+
+
+def test_late_scoring_error_is_recorded_as_failed(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise ArithmeticError("bootstrap broke")
+    monkeypatch.setattr(lenient, "paired_bootstrap", boom)
+    with pytest.raises(ArithmeticError):
+        _run(tmp_path, {"baseline": lambda v: [], "candidate": lambda v: []})
+    record = fe.read_ledger(tmp_path / "final.json")
+    assert record["status"] == "failed" and "scores" not in record

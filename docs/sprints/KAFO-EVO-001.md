@@ -490,8 +490,8 @@ ledger. It is not changed after the run.
 
   Both use the same model, provider, budget, review prompt and parser, and
   the same live Hermes reviewer. Calls interleave per case. In `case_id`
-  order, the baseline goes first at even positions and the candidate at odd
-  ones.
+  order, the baseline goes first on the 1st, 3rd, … case and the candidate
+  on the 2nd, 4th, ….
 - **Primary metric:** candidate minus baseline micro-F1 under **STRICT**
   scoring. STRICT is the gate 3 verifier, unchanged, with exact normalised
   categories.
@@ -512,8 +512,11 @@ ledger. It is not changed after the run.
     `case_id`.
   - Both skills use the same resamples.
   - Quantiles are linearly interpolated.
-- **Missing data:** a failed, skipped or unparseable call is scored as an
-  empty review for that skill and case. Nothing is re-run.
+- **Missing data:** the spend-ledger wrapper automatically re-sends a call
+  that errors or reports no cost, once, as in the full run.
+  - A call that still fails after that, is skipped by the cost cap, or can't
+    be parsed is scored as an empty review for that skill and case.
+  - Nothing else is re-run.
 - **Interpretation:** the candidate counts as better on the sealed test only if
   the primary CI's lower bound is above 0. The secondary result cannot
   override the primary.
@@ -526,8 +529,17 @@ ledger. It is not changed after the run.
   - It goes through `final_evaluation.run_paired_final_evaluation` and the
     run-once ledger `reports/kafo-evo-001/final_test_evaluation.json`.
     Exclusive-create means a failed run also counts as the one run.
-  - Only per-case counts are recorded. No sealed code, labels or findings
-    text appear in the ledger, the report or PRs.
+  - The committed ledger stores, per skill and case:
+    - case ID;
+    - TP, FP and FN counts;
+    - completion and parse flags;
+    - cost, cost status and latency;
+    - model;
+    - error and exception types, and a violation count.
+
+    It never stores sealed code, labels, findings, or free-text error or
+    violation messages. Those stay in the run's own spend ledger, outside the
+    repo. The report and PRs show aggregates only.
 
 ## Scientific acceptance criteria
 

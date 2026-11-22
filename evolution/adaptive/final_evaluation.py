@@ -71,8 +71,9 @@ ANALYSIS_PLAN = {
     "id": "kafo-evo-001-final-eval-plan/1",
     "design": ("paired: the baseline and the candidate skill each review the same "
                "sealed test cases once (sample 0), same model, provider, budget, "
-               "prompt and parser; calls interleave per case, baseline first on even "
-               "positions of the case_id order and candidate first on odd ones"),
+               "prompt and parser; calls interleave per case, in case_id order the "
+               "baseline goes first on the 1st, 3rd, ... case and the candidate on the "
+               "2nd, 4th, ..."),
     "primary": ("candidate minus baseline micro-F1 under STRICT scoring (gate 3 "
                 "verifier, exact normalised category)"),
     "secondary": ("candidate minus baseline micro-F1 under LENIENT scoring (strict "
@@ -83,8 +84,11 @@ ANALYSIS_PLAN = {
     "ci": ("95% paired percentile bootstrap over cases: 10000 resamples of case "
            "indices (random.Random(0), cases sorted by case_id), the same resamples "
            "for both skills, linearly interpolated quantiles"),
-    "missing_data": ("a failed, skipped or unparseable call is scored as an empty "
-                     "review for that skill and case; nothing is re-run"),
+    "missing_data": ("a call that errors or reports no cost is re-sent once "
+                     "automatically by the spend-ledger wrapper (as in the full run); "
+                     "a call still failed after that, skipped (cost cap) or unparseable "
+                     "is scored as an empty review for that skill and case; nothing "
+                     "else is re-run"),
     "interpretation": ("the candidate counts as better on the sealed test only if the "
                        "primary CI lower bound is above 0; the secondary result cannot "
                        "override the primary; synthetic hand-written cases, so no claim "
@@ -339,6 +343,30 @@ def _arm_record(results: Sequence[verifier.CaseResult], *, seed: int, n_bootstra
                       for r in sorted(results, key=lambda r: r.case_id)]}
 
 
+def _committable_summary(summary: Mapping) -> dict:
+    """A reviewer summary safe to commit: per case only IDs, numbers, flags and
+    error TYPES. Free text (errors, exception messages, violation reasons) may
+    echo sealed content, so it stays in the run's own spend ledger."""
+    if "error" in summary and "cases" not in summary:      # summary() itself failed
+        return {"error": str(summary["error"]).split(":", 1)[0]}
+    out = {k: v for k, v in summary.items() if k != "cases"}
+    rows = []
+    for c in summary.get("cases", []):
+        row = {k: c[k] for k in ("case_id", "completed", "parse_ok", "cost_usd",
+                                 "cost_status", "latency_s", "model") if k in c}
+        if "skipped" in c:
+            row["skipped"] = True
+        if "exception" in c:
+            row["exception_type"] = str(c["exception"]).split(":", 1)[0]
+        if "error" in c:
+            row["error"] = c["error"] is not None
+        if "violation_reasons" in c:
+            row["violations"] = len(c["violation_reasons"])
+        rows.append(row)
+    out["cases"] = rows
+    return out
+
+
 def run_paired_final_evaluation(reviewers: Mapping[str, Callable[[Mapping], Sequence]], *,
                                 skill_versions: Mapping[str, str], reviewer_id: str,
                                 synthetic: bool, confirm: str,
@@ -396,7 +424,7 @@ def run_paired_final_evaluation(reviewers: Mapping[str, Callable[[Mapping], Sequ
             holder: dict = {}
             _add_summary(holder, reviewers[arm])
             if "reviewer_summary" in holder:
-                out[arm] = holder["reviewer_summary"]
+                out[arm] = _committable_summary(holder["reviewer_summary"])
         if out:
             record["reviewer_summaries"] = out
 
@@ -421,6 +449,17 @@ def run_paired_final_evaluation(reviewers: Mapping[str, Callable[[Mapping], Sequ
                   for a in ARMS}
         loose = {a: tuple(lenient.score_case(c, reviews[a][c.case_id], alternates)
                           for c in cases) for a in ARMS}
+        results = dict(
+            n_cases=len(cases), first_call_by_position=order,
+            scores={name: {a: _arm_record(res[a], seed=seed, n_bootstrap=n_boot,
+                                          confidence=conf) for a in ARMS}
+                    for name, res in (("strict", strict), ("lenient", loose))},
+            paired={name: lenient.paired_bootstrap(res["baseline"], res["candidate"],
+                                                   seed=seed, n_bootstrap=n_boot,
+                                                   confidence=conf)
+                    for name, res in (("strict", strict), ("lenient", loose))},
+            lenient_defects_in_split=sum(d.defect_id in alternates
+                                         for c in cases for d in c.defects))
     except BaseException as exc:
         record.update(status="failed", finished_at=_now(),
                       error=f"{type(exc).__name__}: {exc}"[:500])
@@ -428,18 +467,7 @@ def run_paired_final_evaluation(reviewers: Mapping[str, Callable[[Mapping], Sequ
         _write_replace(path, record)
         logger.error("PAIRED FINAL TEST EVALUATION failed: %s", record["error"])
         raise
-    record.update(
-        status="completed", finished_at=_now(), n_cases=len(cases),
-        first_call_by_position=order,
-        scores={name: {a: _arm_record(res[a], seed=seed, n_bootstrap=n_boot,
-                                      confidence=conf) for a in ARMS}
-                for name, res in (("strict", strict), ("lenient", loose))},
-        paired={name: lenient.paired_bootstrap(res["baseline"], res["candidate"],
-                                               seed=seed, n_bootstrap=n_boot,
-                                               confidence=conf)
-                for name, res in (("strict", strict), ("lenient", loose))},
-        lenient_defects_in_split=sum(d.defect_id in alternates
-                                     for c in cases for d in c.defects))
+    record.update(status="completed", finished_at=_now(), **results)
     summaries()
     _write_replace(path, record)
     p = record["paired"]["strict"]["micro_f1"]
