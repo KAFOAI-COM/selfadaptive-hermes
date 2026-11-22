@@ -128,8 +128,16 @@ def test_skipped_stage_is_not_marked_done(tmp_path, hermes_repo):
     assert report["stages"]["gepa"]["status"] == "skipped"
 
 
+def _require_gepa():
+    dspy = pytest.importorskip("dspy")
+    import inspect
+    params = inspect.signature(dspy.GEPA.__init__).parameters
+    if not {"reflection_lm", "max_metric_calls"} <= set(params):
+        pytest.skip("installed dspy.GEPA lacks reflection_lm/max_metric_calls")
+
+
 def test_gepa_stage_with_stub_lms(tmp_path, hermes_repo):
-    pytest.importorskip("dspy")
+    _require_gepa()
     run = make_run(tmp_path, hermes_repo)
     report = run.run(["gepa"], gepa_factory=fr.stub_gepa_factory(20), gepa_max_metric_calls=20)
     gepa = report["stages"]["gepa"]
@@ -201,3 +209,82 @@ def test_cli_refuses_a_run_dir_inside_the_repo(tmp_path, capsys):
     with pytest.raises(SystemExit):
         fr.main(["--run-dir", "output/full-run", "--skill-file", str(skill)])
     assert "outside the repository" in capsys.readouterr().err
+
+
+def test_gepa_budget_stop_terminates_the_stage(tmp_path, hermes_repo):
+    _require_gepa()
+    run = make_run(tmp_path, hermes_repo, stop_usd=0.05)
+    report = run.run(["gepa"], gepa_factory=fr.stub_gepa_factory(40, stub_cost_usd=0.01),
+                     gepa_max_metric_calls=40)
+    assert report["stages"]["gepa"]["status"] == "stopped"
+    assert report["spend"]["spent_usd"] <= 0.05 + 1e-9
+    assert not list((run.run_dir / "gepa").glob("**/evolved_skill.md")) \
+        if (run.run_dir / "gepa").exists() else True
+
+
+def test_a_run_dir_cannot_be_reused_with_another_identity(tmp_path, hermes_repo):
+    make_run(tmp_path, hermes_repo).run(["canary"])
+    run_dir = tmp_path / "run"
+    other = fr.FullRun(run_dir=run_dir, skill_text="# Review skill\nLook for defects.\n",
+                       skill_source="test",
+                       executor=make_executor(hermes_repo, model="another-model"),
+                       ledger=fr.SpendLedger(run_dir / "ledger.jsonl", stop_usd=18.0),
+                       live=False, seeds=2, train_episodes=20)
+    with pytest.raises(fr.RunMismatch, match="model"):
+        other.run(["canary"])
+
+
+def test_frontmatter_is_kept_out_of_the_optimised_text():
+    front, body = fr.split_frontmatter("---\nname: github-code-review\n---\n\nBody text.\n")
+    assert front == "name: github-code-review" and body == "Body text.\n"
+    assert fr.split_frontmatter("No frontmatter.\n") == (None, "No frontmatter.\n")
+
+
+def test_secret_values_are_redacted(monkeypatch):
+    monkeypatch.setenv("EXAMPLE_API_KEY", "sk-test-1234567890")
+    assert fr.redact("auth failed for sk-test-1234567890") == \
+        "auth failed for <redacted:EXAMPLE_API_KEY>"
+
+
+def _oracle_runner(run, better_marker):
+    truth = {fr.review_prompt(c.code): c for c in (*run.train_cases, *run.validation_cases)}
+
+    def runner(argv, cwd=None, **kw):
+        fr.stub_runner(argv, cwd=cwd, **kw)
+        request, result = json.load(open(argv[-2])), json.load(open(argv[-1]))
+        if better_marker in (request.get("system_prompt") or ""):
+            case = truth[request["prompt"]]
+            result["final_response"] = json.dumps([
+                {"line_start": d.line_start, "line_end": d.line_end, "category": d.category,
+                 "description": "stub"} for d in case.defects])
+        json.dump(result, open(argv[-1], "w"))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    return runner
+
+
+@pytest.mark.parametrize("better, status", [(True, "admitted"), (False, "rejected")])
+def test_admission_runs_gate6_inside_gate7(tmp_path, hermes_repo, better, status):
+    pytest.importorskip("evolution.adaptive.admission")
+    skill = "# Review skill\nLook for defects.\n"
+    run = make_run(tmp_path, hermes_repo, skill=skill)
+    run.executor._runner = _oracle_runner(run, "BETTER" if better else "NEVER-MATCHES")
+    gepa_dir = run.run_dir / "gepa" / fr.SKILL_NAME / "stub"
+    gepa_dir.mkdir(parents=True)
+    (gepa_dir / "baseline_skill.md").write_text(skill)
+    (gepa_dir / "evolved_skill.md").write_text(skill + "BETTER: stub edit.\n")
+    (gepa_dir / "metrics.json").write_text(json.dumps({"skill_name": fr.SKILL_NAME,
+                                                       "constraints_passed": True}))
+    run.state["stages"]["gepa"] = {"status": "done", "result": {
+        "output_dir": str(gepa_dir),
+        "metrics": {"identical_to_baseline": False, "constraints_passed": True}}}
+    report = run.run(["compare", "admission"])
+    result = report["stages"]["admission"]["result"]
+    assert result["status"] == status, result
+    events = [e["event"] for e in result["gate7"]["checkpoint_log"]]
+    assert events[0] == "save"                       # checkpoint BEFORE gate 6 decides
+    if better:
+        assert result["registry_status"] == "admitted" and events[-1] == "promote"
+    else:
+        assert result["registry_status"] == "rejected" and events[-1] == "restore"
+        assert result["gate7"]["active_skill_version"] == report["baseline_id"]
+    assert report["sealed_split_open_attempts"] == 0

@@ -63,7 +63,6 @@ SKILL_NAME = "github-code-review"
 HARD_CAP_USD = 20.0                 # owner-approved total; --stop-usd may not exceed it
 DEFAULT_STOP_USD = 18.0             # "stop at about 18 and report"
 HERMES_RESERVE_USD = 0.03           # worst-case reserve before a fresh Hermes call
-GEPA_RESERVE_USD = 0.10             # worst-case reserve before a fresh DSPy call
 UNKNOWN_COST_CHARGE_USD = 0.03      # charged when a call's cost is unknown
 # Anthropic list price, claude-sonnet-5-5, USD per million tokens. Hermes'
 # own estimate for the 2026-11-22 smoke run reproduces at these rates. GEPA
@@ -96,6 +95,14 @@ class CanaryFailed(RuntimeError):
     """The canary showed the live setup cannot produce scorable replies."""
 
 
+class GateSixRejected(RuntimeError):
+    """Gate 6 rejected the candidate inside gate 7's admit step."""
+
+
+class RunMismatch(RuntimeError):
+    """The run directory belongs to a run with a different identity."""
+
+
 def review_prompt(code: str) -> str:
     return REVIEW_TEMPLATE.format(code=code)
 
@@ -125,6 +132,19 @@ def _sha256(data: bytes | str) -> str:
 
 def _canonical(obj) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
+
+_SECRET_NAME = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+
+
+def redact(text: Optional[str]) -> Optional[str]:
+    """Replace the values of secret-looking environment variables in ``text``."""
+    if not text:
+        return text
+    for name, value in os.environ.items():
+        if len(value) >= 8 and any(m in name.upper() for m in _SECRET_NAME) and value in text:
+            text = text.replace(value, f"<redacted:{name}>")
+    return text
 
 
 # ------------------------------------------------------------------ ledger
@@ -167,6 +187,9 @@ class SpendLedger:
 
     def record(self, row: dict) -> dict:
         row = {"recorded_at": datetime.now(timezone.utc).isoformat(), **row}
+        for field in ("error", "output"):
+            if isinstance(row.get(field), str):
+                row[field] = redact(row[field])
         with open(self.path, "a", encoding="utf-8") as handle:
             handle.write(_canonical(row) + "\n")
             handle.flush()
@@ -309,7 +332,7 @@ class FullRun:
 
     def _save(self) -> None:
         tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state, indent=2, sort_keys=True, default=str),
+        tmp.write_text(redact(json.dumps(self.state, indent=2, sort_keys=True, default=str)),
                        encoding="utf-8")
         tmp.replace(self.state_path)
 
@@ -380,6 +403,15 @@ class FullRun:
             return dspy.Prediction(score=res.f1, feedback=" ".join(notes))
 
         program = dspy.Predict(dspy.Signature("request: str -> findings_json: str", body))
+        # Preflight: one task call and one reflection-model call, so a bad model
+        # string or key fails here instead of as ~170 swallowed GEPA failures.
+        first = self.train_cases[0]
+        with dspy.context(lm=task_lm):
+            probe = program(request=review_prompt(first.code))
+        if not parse_findings(getattr(probe, "findings_json", "") or "")[1]:
+            raise CanaryFailed("GEPA preflight: task model reply is not a JSON findings list")
+        if not reflection_lm("Reply with the single word OK."):
+            raise CanaryFailed("GEPA preflight: reflection model returned nothing")
         log_dir = self.run_dir / "gepa_log"
         optimizer = dspy.GEPA(metric=metric, max_metric_calls=max_metric_calls,
                               reflection_lm=reflection_lm, num_threads=1, seed=seed,
@@ -420,76 +452,121 @@ class FullRun:
 
     # 4 ------------------------------------------------------------------
     def admission(self) -> dict:
+        """Gate 5 registration, then gate 7 around gate 6.
+
+        Mirrors PR #8's composition (tests/test_admission_rollback.py): gate 7
+        validates the current policy and saves a ``good`` checkpoint FIRST;
+        the gate 6 review runs inside gate 7's ``admit`` step; a gate 6
+        rejection raises, so gate 7 restores the pre-admission checkpoint.
+        Known limit (pinned by PR #8): if gate 6 admits but gate 7 rolls back,
+        the registry entry stays ``admitted``; the active skill version and
+        the catalogue return to the baseline.
+        """
         from . import admission as adm        # gate 6 (PR #8)
         from .checkpoint import CheckpointStore, admit_with_rollback, validation_utility
         from .gepa_adapter import register_gepa_output
         from .registry import CandidateRegistry
 
         gepa = self.state["stages"].get("gepa", {}).get("result")
-        if not gepa:
+        if not gepa or gepa.get("status") == "skipped":
             return {"status": "skipped", "reason": "no GEPA output"}
         if gepa["metrics"]["identical_to_baseline"]:
-            return {"status": "skipped", "reason": "GEPA returned the baseline unchanged"}
-        registry = CandidateRegistry(self.run_dir / "registry.sqlite")
-        try:
+            return {"status": "not_run", "reason": "GEPA returned the baseline unchanged; "
+                                                    "nothing to admit"}
+        if not gepa["metrics"]["constraints_passed"]:
+            return {"status": "not_run", "reason": "GEPA output failed constraints"}
+
+        with CandidateRegistry(self.run_dir / "registry.sqlite") as registry, \
+                CheckpointStore(self.run_dir / "checkpoints.sqlite") as store:
             registry.register_baseline(SKILL_NAME, self.skill_text.encode("utf-8"),
                                        provenance={"source": self.skill_source,
                                                    "run": RUN_VERSION})
             cand = register_gepa_output(registry, gepa["output_dir"], skill_name=SKILL_NAME)
-            out = {"candidate_id": cand.candidate_id, "parent_id": cand.parent_id}
-            if not gepa["metrics"]["constraints_passed"]:
-                return {**out, "status": "skipped", "reason": "GEPA output failed constraints"}
-            decision = adm.review_registered(
-                registry, cand.candidate_id, base=Strategy("review"),
-                make_executor=lambda seed: self._exec("admission", sample=seed), apply=True)
-            out["decision"] = decision.to_dict()
-            out["registry_status"] = registry.get(cand.candidate_id).status
-            if not decision.admitted:
-                return {**out, "status": "rejected", "gate7": "not run: nothing admitted"}
             candidate_text = registry.content(cand.candidate_id).decode("utf-8")
-        finally:
-            registry.conn.close()
+            out = {"candidate_id": cand.candidate_id, "parent_id": cand.parent_id,
+                   "registered_status": registry.get(cand.candidate_id).status}
+            live_catalogue = {"current": dict(self.catalogue)}
+            decisions = []
 
-        live_catalogue = {"current": dict(self.catalogue)}
+            def admit(policy) -> str:
+                decision = adm.review_registered(
+                    registry, cand.candidate_id, base=Strategy("review"),
+                    make_executor=lambda seed: self._exec("admission", sample=seed),
+                    apply=True)
+                decisions.append(decision)
+                if not decision.admitted:
+                    raise GateSixRejected("; ".join(decision.reasons))
+                live_catalogue["current"] = {
+                    **self.catalogue, "skill": Strategy("skill", system_prompt=candidate_text)}
+                return cand.candidate_id
 
-        def admit(policy) -> str:
-            live_catalogue["current"] = {
-                **self.catalogue, "skill": Strategy("skill", system_prompt=candidate_text)}
-            return cand.candidate_id
+            def validate(policy):
+                return validation_utility(policy, self._exec("gate7"), review_quality,
+                                          live_catalogue["current"], self.encoder, SCORING,
+                                          prompt_template=REVIEW_TEMPLATE)
 
-        def validate(policy):
-            return validation_utility(policy, self._exec("gate7"), review_quality,
-                                      live_catalogue["current"], self.encoder, SCORING,
-                                      prompt_template=REVIEW_TEMPLATE)
-
-        policy = self.trained_policy(self._exec("compare"))
-        with CheckpointStore(self.run_dir / "checkpoints.sqlite") as store:
-            result = admit_with_rollback(store, policy, skill_version=self.state["baseline_id"],
-                                         admit=admit, validate=validate,
-                                         label=f"admission:{cand.candidate_id}")
-            log = store.log()
-        if not result.admitted:
-            live_catalogue["current"] = dict(self.catalogue)
-        out["gate7"] = {"admitted": result.admitted, "reason": result.reason,
-                        "rolled_back": not result.admitted,
-                        "pre_validation": result.pre_validation.to_dict(),
-                        "post_validation": (result.post_validation.to_dict()
-                                            if result.post_validation else None),
-                        "active_skill_version": result.skill_version, "checkpoint_log": log}
-        out["status"] = "admitted" if result.admitted else "rolled_back"
+            policy = self.trained_policy(self._exec("compare"))
+            try:
+                result = admit_with_rollback(
+                    store, policy, skill_version=self.state["baseline_id"], admit=admit,
+                    validate=validate, label=f"admission:{cand.candidate_id}")
+            except GateSixRejected as exc:
+                result = None
+                out.update(status="rejected", reason=f"gate 6 rejected: {exc}",
+                           gate7={"admitted": False, "rolled_back": True,
+                                  "reason": "pre-admission checkpoint restored after "
+                                            "gate 6 rejection",
+                                  "active_skill_version": self.state["baseline_id"]})
+            if decisions:
+                out["decision"] = decisions[-1].to_dict()
+            out["registry_status"] = registry.get(cand.candidate_id).status
+            if result is not None:
+                if not result.admitted:
+                    live_catalogue["current"] = dict(self.catalogue)
+                out["gate7"] = {"admitted": result.admitted, "reason": result.reason,
+                                "rolled_back": not result.admitted,
+                                "pre_validation": result.pre_validation.to_dict(),
+                                "post_validation": (result.post_validation.to_dict()
+                                                    if result.post_validation else None),
+                                "active_skill_version": result.skill_version}
+                out["status"] = "admitted" if result.admitted else "rolled_back"
+            out["gate7"]["checkpoint_log"] = store.log()
+            out["active_catalogue"] = {k: _sha256(v.system_prompt)[:12]
+                                       for k, v in live_catalogue["current"].items()}
         return out
 
     # ------------------------------------------------------------------
+    def identity(self) -> dict:
+        return {"run_version": RUN_VERSION, "mode": "live" if self.live else "stub",
+                "model": self.executor.model, "provider": self.executor.provider,
+                "budget": asdict(self.executor.budget),
+                "skill_sha256": _sha256(self.skill_text.encode("utf-8"))}
+
     def run(self, stages: Sequence[str], *, gepa_factory: Optional[Callable] = None,
             gepa_max_metric_calls: int = 150) -> dict:
+        identity = self.identity()
+        recorded = self.state.setdefault("identity", identity)
+        if recorded != identity:
+            changed = sorted(k for k in identity if recorded.get(k) != identity[k])
+            raise RunMismatch(f"{self.run_dir} belongs to another run (differs in {changed}); "
+                              "use a new --run-dir")
         self.state.setdefault("baseline_id",
-                              f"{SKILL_NAME}@{_sha256(self.skill_text.encode('utf-8'))[:12]}")
+                              f"{SKILL_NAME}@{identity['skill_sha256'][:12]}")
         sealed_before = bm._sealed_attempts
+        try:
+            with optimisation_phase():      # every stage; the sealed split stays shut
+                self._run_stages(stages, gepa_factory, gepa_max_metric_calls)
+        finally:
+            self.state["sealed_split_open_attempts"] = bm._sealed_attempts - sealed_before
+            self._save()
+            report = self.report()
+        return report
+
+    def _run_stages(self, stages, gepa_factory, gepa_max_metric_calls) -> None:
         for stage in STAGES:
             if stage not in stages:
                 continue
-            done = self.state["stages"].get(stage, {})
-            if done.get("status") == "done":
+            if self.state["stages"].get(stage, {}).get("status") == "done":
                 continue
             started = time.perf_counter()
             try:
@@ -510,28 +587,25 @@ class FullRun:
                     result = getattr(self, stage)()
                 # A skipped stage is not "done": a resumed run tries it again.
                 status = "skipped" if result.get("status") == "skipped" else "done"
-                self.state["stages"][stage] = {"status": status, "result": result,
-                                               "reason": result.get("reason") if status == "skipped" else None,
-                                               "seconds": round(time.perf_counter() - started, 1)}
+                self.state["stages"][stage] = {
+                    "status": status, "result": result,
+                    "reason": result.get("reason") if status == "skipped" else None,
+                    "seconds": round(time.perf_counter() - started, 1)}
             except (BudgetExhausted, CanaryFailed) as exc:
                 self.state["stages"][stage] = {"status": "stopped",
-                                               "reason": f"{type(exc).__name__}: {exc}"}
-                self._save()
-                break
+                                               "reason": redact(f"{type(exc).__name__}: {exc}")}
+                return
             except Exception as exc:
                 self.state["stages"][stage] = {"status": "error",
-                                               "reason": f"{type(exc).__name__}: {exc}"}
-                self._save()
+                                               "reason": redact(f"{type(exc).__name__}: {exc}")}
                 raise
-            self._save()
-        self.state["sealed_split_open_attempts"] = bm._sealed_attempts - sealed_before
-        self._save()
-        return self.report()
+            finally:
+                self._save()
 
     def report(self) -> dict:
         report = {
             "run_version": RUN_VERSION, "mode": "live" if self.live else "stub",
-            "notice": SYNTHETIC_NOTICE, "skill_name": SKILL_NAME,
+            "identity": self.state.get("identity"), "notice": SYNTHETIC_NOTICE, "skill_name": SKILL_NAME,
             "skill_source": self.skill_source,
             "skill_sha256": _sha256(self.skill_text.encode("utf-8")),
             "baseline_id": self.state.get("baseline_id"),
@@ -541,68 +615,94 @@ class FullRun:
             "sealed_split_open_attempts": self.state.get("sealed_split_open_attempts"),
             "stages": self.state["stages"], "spend": self.ledger.summary()}
         (self.run_dir / "report.json").write_text(
-            json.dumps(report, indent=2, sort_keys=True, default=str), encoding="utf-8")
+            redact(json.dumps(report, indent=2, sort_keys=True, default=str)), encoding="utf-8")
         return report
 
 
 # ------------------------------------------------------------------ GEPA LMs
 
+GEPA_INPUT_TOKENS_BOUND = 12_000    # skill (~3.3k) + minibatch traces + DSPy framing
+
+
+def call_reserve_usd(max_tokens: int) -> float:
+    """Worst case for one DSPy call: a full input bound plus the output cap."""
+    return (GEPA_INPUT_TOKENS_BOUND * PRICE_PER_M["input"]
+            + max_tokens * PRICE_PER_M["output"]) / 1e6
+
+
 def budgeted_lm(model: str, ledger: SpendLedger, *, role: str, max_tokens: int,
-                dummy_answers: Optional[list] = None):
-    """A dspy LM whose every call is reserved against, and recorded in, the ledger."""
+                dummy_answers: Optional[list] = None, stub_cost_usd: float = 0.0):
+    """A dspy LM whose every call is reserved against, and recorded in, the ledger.
+
+    Cost comes from the returned token usage at list price, input and output
+    (thinking included) with no cache discount. With ``dummy_answers`` the LM
+    is ``dspy.utils.DummyLM`` (offline) charged ``stub_cost_usd`` per call.
+    """
     import dspy
     from dspy.utils import DummyLM
 
     base = DummyLM if dummy_answers is not None else dspy.LM
+    reserve = call_reserve_usd(max_tokens) if dummy_answers is None else max(stub_cost_usd, 0.0)
 
     class BudgetedLM(base):
         def __call__(self, *args, **kwargs):
-            ledger.reserve(GEPA_RESERVE_USD)
+            ledger.reserve(reserve)
             seen = len(self.history)
-            error = None
+            error, started = None, time.perf_counter()
             try:
                 return super().__call__(*args, **kwargs)
             except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"[:300]
+                error = redact(f"{type(exc).__name__}: {exc}"[:300])
                 raise
             finally:
+                latency = round(time.perf_counter() - started, 3)
                 entries = self.history[seen:]
                 if not entries:
                     ledger.record({"kind": "dspy", "stage": f"gepa:{role}", "model": model,
                                    "error": error or "no history entry", "cost_usd": None,
-                                   "charge_if_unknown": GEPA_RESERVE_USD})
+                                   "charge_if_unknown": reserve, "latency_s": latency})
                 for entry in entries:
                     usage = entry.get("usage") or {}
                     tin, tout = usage.get("prompt_tokens"), usage.get("completion_tokens")
-                    cost = (None if tin is None or tout is None else
-                            (tin * PRICE_PER_M["input"] + tout * PRICE_PER_M["output"]) / 1e6)
                     if dummy_answers is not None:
-                        cost = 0.0
+                        cost = stub_cost_usd
+                    elif tin is None or tout is None:
+                        cost = None
+                    else:
+                        cost = (tin * PRICE_PER_M["input"] + tout * PRICE_PER_M["output"]) / 1e6
                     ledger.record({"kind": "dspy", "stage": f"gepa:{role}", "model": model,
                                    "input_tokens": tin, "output_tokens": tout,
-                                   "cost_usd": cost, "charge_if_unknown": GEPA_RESERVE_USD,
-                                   "error": error, "cost_basis": "list price, no cache discount"})
+                                   "cost_usd": cost, "charge_if_unknown": reserve,
+                                   "error": error, "latency_s": latency / len(entries),
+                                   "cost_basis": "list price, no cache discount"})
 
     if dummy_answers is not None:
         return BudgetedLM(dummy_answers)
     return BudgetedLM(model, max_tokens=max_tokens, cache=False, num_retries=2)
 
 
+GEPA_TASK_MAX_TOKENS = 4_000
+GEPA_REFLECTION_MAX_TOKENS = 16_000
+
+
 def live_gepa_factory(task_model: str, reflection_model: str):
     def factory(ledger):
-        return (budgeted_lm(task_model, ledger, role="task", max_tokens=4000),
-                budgeted_lm(reflection_model, ledger, role="reflection", max_tokens=16000))
+        return (budgeted_lm(task_model, ledger, role="task", max_tokens=GEPA_TASK_MAX_TOKENS),
+                budgeted_lm(reflection_model, ledger, role="reflection",
+                            max_tokens=GEPA_REFLECTION_MAX_TOKENS))
     return factory
 
 
-def stub_gepa_factory(max_metric_calls: int):
+def stub_gepa_factory(max_metric_calls: int, *, stub_cost_usd: float = 0.0):
     def factory(ledger):
         n = 2 * max_metric_calls + 50
         return (budgeted_lm("stub/task", ledger, role="task", max_tokens=0,
-                            dummy_answers=[{"findings_json": "[]"}] * n),
+                            dummy_answers=[{"findings_json": "[]"}] * n,
+                            stub_cost_usd=stub_cost_usd),
                 budgeted_lm("stub/reflection", ledger, role="reflection", max_tokens=0,
                             dummy_answers=[{"new_instruction": "STUB GEPA EDIT: review the "
-                                            "code and reply with only a JSON list."}] * n))
+                                            "code and reply with only a JSON list."}] * n,
+                            stub_cost_usd=stub_cost_usd))
     return factory
 
 
@@ -683,8 +783,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   skill_source=args.skill_source or str(args.skill_file), executor=executor,
                   ledger=ledger, live=args.live, seeds=args.seeds,
                   train_episodes=args.train_episodes)
-    report = run.run(stages, gepa_factory=gepa_factory,
-                     gepa_max_metric_calls=args.gepa_max_metric_calls)
+    try:
+        report = run.run(stages, gepa_factory=gepa_factory,
+                         gepa_max_metric_calls=args.gepa_max_metric_calls)
+    except RunMismatch as exc:
+        p.error(str(exc))
     spend = report["spend"]
     print(f"mode={report['mode']} spent=${spend['spent_usd']:.4f} stop=${spend['stop_usd']:.2f}")
     for stage, info in report["stages"].items():
