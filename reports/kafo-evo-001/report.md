@@ -128,7 +128,7 @@ Source: live Hermes smoke run, 2026-11-22, owner-approved (PR #10); transcribed 
 
 ## Final test evaluation (one-time, recorded)
 
-The one-time final test evaluation has not been run; when and on which reviewer is an owner decision. It is run by `evolution.adaptive.final_evaluation.run_final_evaluation`, which refuses a second run.
+The one-time final test evaluation has not been run; when and on which reviewer is an owner decision. It will be the pre-registered paired run (baseline and candidate skill on the same sealed cases; strict scoring primary, lenient secondary; see docs/sprints/KAFO-EVO-001.md), through `evolution.adaptive.final_evaluation.run_paired_final_evaluation`, which refuses a second run.
 
 ## Pending
 

@@ -161,8 +161,10 @@ Hermes improves on any real task.**
       files equal fresh output. **Synthetic**, apart from the 4-case live smoke
       run, which is labelled a plumbing check. Headline, derived from the
       verdicts: no adaptive policy beats the best fixed strategy on validation.
-      The one-time final test evaluation (`final_evaluation.run_final_evaluation`,
-      run-once ledger) is built but **not run**: owner decision.)
+      The one-time final test evaluation is built but **not run**: owner decision.
+      It will be the pre-registered paired run
+      (`final_evaluation.run_paired_final_evaluation`, run-once ledger); see
+      "Pre-registered analysis plan" below.)
 
 ## Hermes executor (gate 1)
 
@@ -473,6 +475,71 @@ in-process step built for the report gate, through
 That call loads the split with the integrity-checked loader, logs the
 unsealing, and refuses inside an optimisation phase. Its results must not feed
 back into optimisation or selection.
+
+### Pre-registered analysis plan for the one-time final evaluation
+
+Registered 2026-11-22, before any call on the sealed split (owner decision,
+option 1). Plan ID `kafo-evo-001-final-eval-plan/1`. The same plan is the
+`final_evaluation.ANALYSIS_PLAN` constant, and its SHA-256 is recorded in the
+ledger. It is not changed after the run.
+
+- **Design: paired.** Two skills review the same 10 sealed test cases, once
+  each (sample 0):
+  - the baseline skill `github-code-review@11ad06e6d49b`;
+  - the admitted, kept GEPA candidate `github-code-review@28dcec5ab528`.
+
+  Both use the same model, provider, budget, review prompt and parser, and
+  the same live Hermes reviewer. Calls interleave per case. In `case_id`
+  order, the baseline goes first on the 1st, 3rd, … case and the candidate
+  on the 2nd, 4th, ….
+- **Primary metric:** candidate minus baseline micro-F1 under **STRICT**
+  scoring. STRICT is the gate 3 verifier, unchanged, with exact normalised
+  categories.
+- **Secondary metric:** the same difference under **LENIENT** scoring. LENIENT
+  uses the strict line rules, one-to-one matching and counting, and also
+  accepts the alternate valid categories recorded by the independent label
+  audit.
+  - The alternates are a scoring-side table,
+    `evolution/adaptive/category_alternates_v1.json`, pinned by SHA-256 in
+    `lenient.ALTERNATES_SHA256`. It covers 15 defects across all splits.
+  - The dataset, its labels and its manifest are not modified.
+- **Descriptive only, no inference:**
+  - per-skill micro precision, recall and F1, and macro F1, each with a CI;
+  - the paired macro-F1, micro-precision and micro-recall differences;
+  - cost, completions, parse failures and violations.
+- **CI method:** a 95% paired percentile bootstrap over cases.
+  - 10000 resamples of case indices, `random.Random(0)`, with cases sorted by
+    `case_id`.
+  - Both skills use the same resamples.
+  - Quantiles are linearly interpolated.
+- **Missing data:** the spend-ledger wrapper automatically re-sends a call
+  that errors or reports no cost, once, as in the full run.
+  - A call that still fails after that, is skipped by the cost cap, or can't
+    be parsed is scored as an empty review for that skill and case.
+  - Nothing else is re-run.
+- **Interpretation:** the candidate counts as better on the sealed test only if
+  the primary CI's lower bound is above 0. The secondary result cannot
+  override the primary.
+  - The cases are synthetic and hand-written, so no result here is a claim of
+    a real Hermes improvement.
+  - With 10 cases the intervals are expected to be wide.
+- **Spend and run-once:** the run has a shared USD 2 cap across both skills.
+  Spend is also recorded in the full run's spend ledger, under the USD 20
+  run cap.
+  - It goes through `final_evaluation.run_paired_final_evaluation` and the
+    run-once ledger `reports/kafo-evo-001/final_test_evaluation.json`.
+    Exclusive-create means a failed run also counts as the one run.
+  - The committed ledger stores, per skill and case:
+    - case ID;
+    - TP, FP and FN counts;
+    - completion and parse flags;
+    - cost, cost status and latency;
+    - model;
+    - error and exception types, and a violation count.
+
+    It never stores sealed code, labels, findings, or free-text error or
+    violation messages. Those stay in the run's own spend ledger, outside the
+    repo. The report and PRs show aggregates only.
 
 ## Scientific acceptance criteria
 

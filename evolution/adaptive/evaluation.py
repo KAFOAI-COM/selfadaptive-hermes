@@ -12,8 +12,9 @@ separation"):
   manifest. No other module builds paths into ``datasets/python_review``.
 * Optimisation and selection use the open splits only (:func:`open_cases`,
   :func:`evaluate_open`).
-* :func:`evaluate_sealed_test` is the single place that unseals the test
-  split. It needs ``final_evaluation=True`` and refuses inside
+* :func:`sealed_test_cases` is the single place that unseals the test
+  split; :func:`evaluate_sealed_test` scores through it. Both need
+  ``final_evaluation=True`` and refuse inside
   ``benchmark.optimisation_phase()``.
 
 The verifier keeps its own case type and imports only the standard library,
@@ -84,6 +85,27 @@ def review_input(case) -> Mapping:
         "context": MappingProxyType({"difficulty": case.difficulty, "domain": case.domain})})
 
 
+def sealed_test_cases(*, final_evaluation: bool = False,
+                      version: str = benchmark.DEFAULT_VERSION
+                      ) -> tuple[verifier.BenchmarkCase, ...]:
+    """The sealed test cases, labels included, sorted by ``case_id``.
+
+    The single place that unseals the test split. Same rules as
+    :func:`evaluate_sealed_test` (which uses it): ``final_evaluation=True``,
+    refused inside an optimisation phase. Only the recorded, run-once steps
+    in ``evolution.adaptive.final_evaluation`` may call it (guard scan in
+    ``tests/test_benchmark_integration.py``). Reviewers get
+    :func:`review_input` of these cases, never the cases themselves.
+    """
+    if final_evaluation is not True:
+        raise benchmark.SealedSplitError(
+            "sealed_test_cases needs final_evaluation=True; use open_cases "
+            "during optimisation and selection")
+    cases = tuple(to_verifier_case(c) for c in benchmark.load_split(
+        "test", version=version, allow_sealed_test=True))
+    return tuple(sorted(cases, key=lambda c: c.case_id))
+
+
 def evaluate_sealed_test(reviews: Mapping[str, Sequence] | None = None, *,
                          reviewer: Callable[[Mapping], Sequence] | None = None,
                          final_evaluation: bool = False,
@@ -107,8 +129,7 @@ def evaluate_sealed_test(reviews: Mapping[str, Sequence] | None = None, *,
         raise ValueError("pass exactly one of reviews or reviewer")
     if reviewer is not None and not callable(reviewer):
         raise TypeError("reviewer must be callable")
-    cases = tuple(to_verifier_case(c) for c in benchmark.load_split(
-        "test", version=version, allow_sealed_test=True))
+    cases = sealed_test_cases(final_evaluation=True, version=version)
     if reviewer is not None:
         reviews = {c.case_id: reviewer(review_input(c)) for c in cases}
     unknown = sorted(set(reviews) - {c.case_id for c in cases})
