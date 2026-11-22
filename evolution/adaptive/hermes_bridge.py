@@ -37,7 +37,8 @@ import time
 
 # Run-result keys copied verbatim when present (see agent/turn_finalizer.py).
 _BOOL_KEYS = ("completed", "failed", "partial", "interrupted")
-_INT_KEYS = ("api_calls", "input_tokens", "output_tokens", "total_tokens")
+_INT_KEYS = ("api_calls", "input_tokens", "output_tokens", "total_tokens",
+             "cache_read_tokens", "cache_write_tokens")
 _STR_KEYS = ("turn_exit_reason", "cost_status", "cost_source", "model", "provider",
              "failure_reason")
 _MAX_TEXT = 200_000   # cap on final_response characters written back

@@ -88,7 +88,7 @@ Hermes improves on any real task.**
       (185 passed, Python 3.12 + dspy 3.5.0; Python 3.14 has no dspy install here).
 - [x] Implement a Hermes executor adapter using an actually supported API
       (`AIAgent.run_conversation`, contract-checked against hermes-agent source;
-      offline tests only — **no live Hermes/LLM run yet**, see "Hermes executor (gate 1)").
+      plus a 4-case live smoke run on 2026-11-22, see "Hermes executor (gate 1)").
 - [x] Build labelled Python-review benchmark with ground-truth defect IDs.
       (`datasets/python_review/v1`: 48 hand-written synthetic cases, 50 defects,
       8 clean controls; train 28 / validation 10 / sealed test 10; SHA-256
@@ -183,10 +183,42 @@ an unknown cost is refused. `loop_executor(...)` plugs an executor into
 
 - `HermesExecutor` refuses to run unless constructed with `allow_live=True`;
   a live run spends LLM credit from the local Hermes configuration.
-- **No live run against real Hermes and a real model has been done yet.**
-  Evidence so far: offline unit tests, a real subprocess run of the bridge
-  against a stub `run_agent`, and an AST contract test against the local
-  hermes-agent source (skipped on CI, which has no checkout).
+- Offline evidence: unit tests, a real subprocess run of the bridge against a
+  stub `run_agent`, and an AST contract test against the local hermes-agent
+  source. The contract test is skipped on CI, which has no checkout; it passed
+  locally against `caafe5389a` on 2026-11-22.
+- `model` must be passed explicitly. `AIAgent(model="")` does not resolve the
+  configured model: the provider failed with `model is required`. A live
+  `HermesExecutor` with no model now raises `ValueError` before any call.
+- `HERMES_PYTHON` must be Hermes' own PM interpreter. On the test machine that
+  was `~/.hermes/tools/python-3.14.9+…/bin/python3`, shown by
+  `hermes --print-runtime-command`. Set `HERMES_DISABLE_LAZY_INSTALLS=1` so
+  Hermes' launch path never syncs or installs dependencies.
+
+### Live smoke run (2026-11-22, owner-approved, cap USD 5)
+
+**Four cases. This is a plumbing check, not evidence that Hermes improves or
+performs well.** Model `claude-sonnet-5-5[1m]`, provider
+`claude-subscription-directsdk-experimental` (the local Hermes default: the
+`claude` CLI with no built-in tools, no user settings or MCP, one turn). No
+toolsets. Budget: 2 iterations, 240 s, 2000 max tokens, USD 1 per case.
+Validation-split cases only, scored by `evolution.adaptive.verifier`.
+
+| Case | Difficulty | Defects | Tokens out / total | Est. cost USD | Latency s | P / R / F1 |
+|---|---|---|---|---|---|---|
+| pyrev-007 | simple | 1 | 321 / 1647 | 0.0041 | 4.3 | 0.33 / 1.00 / 0.50 |
+| pyrev-008 | moderate | 1 | 320 / 1687 | 0.0045 | 3.7 | 0.50 / 1.00 / 0.67 |
+| pyrev-031 | moderate | 0 (clean) | 4 / 1388 | 0.0014 | 3.7 | 1.00 / 1.00 / 1.00 |
+| pyrev-043 | complex | 2 | 474 / 1890 | 0.0063 | 5.2 | 0.67 / 1.00 / 0.80 |
+
+- No errors, tool calls or violations. The Hermes checkout was unchanged.
+- Estimated spend across all attempts: about USD 0.025. This includes an
+  earlier single-case run; a first attempt failed before any model call.
+- `cost_status` was `estimated`, which Hermes prices at API rates. The
+  provider bills the Claude subscription, so metered spend may be zero.
+- Most tokens are cache read/write: `input_tokens` was 373 uncached on every
+  case. The bridge now carries `cache_read_tokens` and `cache_write_tokens`.
+- One run, n=4, no confidence intervals.
 - Cost covers the main agent loop only; Hermes reports auxiliary calls
   (title generation, compression, …) separately and they are not included.
 - `python` must be an interpreter that can import hermes-agent

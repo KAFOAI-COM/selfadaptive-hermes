@@ -281,6 +281,12 @@ class HermesExecutor:
     ``python`` must be an interpreter that can import hermes-agent (its own
     environment); default ``$HERMES_PYTHON``, else the current interpreter.
     ``runner`` replaces ``subprocess.run`` in tests.
+
+    ``model`` is required for a live run. Hermes' Python-library guide says an
+    empty model resolves from the user's config, but the first live smoke run
+    (2026-11-22) showed it does not: ``AIAgent(model="")`` reached the provider
+    with no model and failed with ``model is required``. Pass ``model`` (and
+    usually ``provider``) explicitly.
     """
     backend = "hermes"
 
@@ -322,6 +328,9 @@ class HermesExecutor:
         if not self.allow_live:
             raise LiveExecutionDisabled(
                 "HermesExecutor calls a real LLM provider; construct it with allow_live=True")
+        if not self.model:
+            raise ValueError("HermesExecutor needs an explicit model for a live run; "
+                             "AIAgent(model='') does not resolve the configured model")
         repo = self._repo()
         with tempfile.TemporaryDirectory(prefix="kafo-hermes-") as tmp:
             request_path = os.path.join(tmp, "request.json")
@@ -370,7 +379,8 @@ class HermesExecutor:
         tool_calls = tuple(payload.get("tool_calls") or ())
         latency = payload.get("latency_s")
         details = {k: payload[k] for k in ("turn_exit_reason", "cost_source", "provider",
-                                           "total_tokens", "failure_reason", "guardrail",
+                                           "total_tokens", "cache_read_tokens",
+                                           "cache_write_tokens", "failure_reason", "guardrail",
                                            "failed", "partial", "interrupted")
                    if payload.get(k) is not None}
         return ExecutionOutcome(
