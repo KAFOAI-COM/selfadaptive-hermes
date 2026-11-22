@@ -118,7 +118,12 @@ Hermes improves on any real task.**
       of `sealed/` is not blocked.
 - [ ] Connect GEPA skill-candidate generation to the strategy registry.
 - [ ] Require candidate-vs-baseline validation before candidate admission.
-- [ ] Implement policy/skill checkpoint and rollback.
+- [x] Implement policy/skill checkpoint and rollback.
+      (`evolution/adaptive/checkpoint.py`, PR #9; 43 offline tests, full suite
+      473 passed on GitHub Actions. See "Checkpoint and rollback (gate 7)".
+      Limits: the trigger wraps a caller-supplied `admit`, because the admission
+      gates are still open; skill rollback restores the skill version ID only.
+      Synthetic data only.)
 - [ ] Publish quality, utility, cost, latency, uncertainty and safety report.
 
 ## Hermes executor (gate 1)
