@@ -27,9 +27,11 @@ the canary's calls are reused by the comparison (same strategy and request).
 Default mode is a STUB dry run: the real ``HermesExecutor`` runs with a stub
 subprocess runner that never starts Hermes, and GEPA (if dspy is installed)
 runs against ``dspy.utils.DummyLM``. Nothing is spent. ``--live`` needs an
-explicit model and stop amount; the GEPA stage additionally needs
-``--gepa-allow-metered`` because DSPy calls the Anthropic API directly
-(metered ``ANTHROPIC_API_KEY``), not the Hermes subscription provider.
+explicit model and stop amount. Live GEPA needs exactly one route:
+``--gepa-via-hermes`` sends every GEPA task and reflection call through the
+same ``HermesExecutor`` bridge, model and provider as the other stages (no
+API key); ``--gepa-allow-metered`` lets DSPy call the Anthropic API directly
+(metered ``ANTHROPIC_API_KEY``). The two flags are mutually exclusive.
 
 Never loads the sealed split: every stage runs inside
 ``benchmark.optimisation_phase()`` (directly or via the gate 4/6/7 code).
@@ -46,6 +48,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import statistics
 import subprocess
 import sys
@@ -94,6 +97,10 @@ class BudgetExhausted(RuntimeError):
 
 class CanaryFailed(RuntimeError):
     """The canary showed the live setup cannot produce scorable replies."""
+
+
+class GepaCallFailed(RuntimeError):
+    """A GEPA LM call through Hermes failed; the stage fails closed."""
 
 
 class RunMismatch(RuntimeError):
@@ -244,9 +251,9 @@ class LedgerExecutor:
     """Executor wrapper: budget guard, durable record and replay of Hermes calls."""
 
     def __init__(self, inner: HermesExecutor, ledger: SpendLedger, *, stage: str,
-                 sample: int = 0, retries: int = 1):
+                 sample: int = 0, retries: int = 1, reserve_usd: float = HERMES_RESERVE_USD):
         self.inner, self.ledger, self.stage, self.sample = inner, ledger, stage, sample
-        self.retries = retries
+        self.retries, self.reserve_usd = retries, reserve_usd
         self.backend = inner.backend
         self.fresh = self.replayed = 0
 
@@ -262,7 +269,7 @@ class LedgerExecutor:
                 details=dict(row.get("details") or {}),
                 **{f: row[f] for f in _OUTCOME_FIELDS})
         for attempt in range(self.retries + 1):
-            self.ledger.reserve(HERMES_RESERVE_USD)
+            self.ledger.reserve(self.reserve_usd)
             outcome = self.inner.execute(task, strategy)
             self.fresh += 1
             ok = outcome.cost_usd is not None and not outcome.error
@@ -280,6 +287,31 @@ class LedgerExecutor:
         return outcome
 
 
+_STUB_FIELD_VALUES = {"findings_json": "[]",
+                      "new_instruction": "STUB GEPA EDIT: review the code and reply with "
+                                         "only a JSON list."}
+
+
+def _stub_reply(system: str, prompt: str) -> str:
+    """Stub reply: a review JSON list, or DSPy chat-format output fields for GEPA calls."""
+    if "Your output fields are:" in system:                 # a DSPy adapter request
+        section = system.split("Your output fields are:", 1)[1]
+        names = re.findall(r"^\d+\. `([A-Za-z_][A-Za-z0-9_]*)`", section, re.MULTILINE)
+        def field(n):
+            value = _STUB_FIELD_VALUES.get(n, "stub")
+            if f"[[ ## {n} ## ]]" in system:                  # bracket layout
+                return f"[[ ## {n} ## ]]\n{value}"
+            if f"<{n}>" in system:                            # XML-tag layout
+                return f"<{n}>\n{value}\n</{n}>"
+            return json.dumps({n: value})                     # JSON layout
+        if "Outputs will be a JSON object" in system:
+            return json.dumps({n: _STUB_FIELD_VALUES.get(n, "stub") for n in names})
+        return "\n\n".join(field(n) for n in names)
+    if prompt.lstrip().startswith("Review the Python code"):
+        return "[]"                                          # a Hermes review: no findings
+    return "OK"
+
+
 def stub_runner(argv, cwd=None, **_kwargs):
     """Stand-in for ``subprocess.run`` of the Hermes bridge. Never starts Hermes.
 
@@ -293,8 +325,9 @@ def stub_runner(argv, cwd=None, **_kwargs):
     input_tokens = (len(request["prompt"]) + len(request.get("system_prompt") or "")) // 4 + 1100
     output_tokens = 450
     cost = (input_tokens * PRICE_PER_M["input"] + output_tokens * PRICE_PER_M["output"]) / 1e6
+    reply = _stub_reply(request.get("system_prompt") or "", request["prompt"])
     with open(result_path, "w", encoding="utf-8") as handle:
-        json.dump({"ok": True, "completed": True, "final_response": "[]",
+        json.dump({"ok": True, "completed": True, "final_response": reply,
                    "estimated_cost_usd": round(cost, 6), "cost_status": "stub_estimate",
                    "input_tokens": input_tokens, "output_tokens": output_tokens,
                    "api_calls": 1, "latency_s": 4.0, "model": request.get("model"),
@@ -424,6 +457,11 @@ class FullRun:
             optimized = optimizer.compile(program, trainset=examples[:GEPA_TRAIN_CASES],
                                           valset=examples[GEPA_TRAIN_CASES:])
         elapsed = time.perf_counter() - start
+        failures = [f for lm in (task_lm, reflection_lm)
+                    for f in getattr(getattr(lm, "hermes_engine", None), "failures", [])]
+        if failures:
+            raise GepaCallFailed(f"{len(failures)} GEPA call(s) through Hermes failed; "
+                                 f"first: {failures[0]}; no candidate registered")
         if self.ledger.exhausted:
             raise BudgetExhausted("budget stop reached during GEPA; no candidate registered")
         evolved_body = optimized.signature.instructions.strip()
@@ -440,6 +478,9 @@ class FullRun:
         (out_dir / ("evolved_skill.md" if constraints else "evolved_FAILED.md")).write_text(
             evolved, encoding="utf-8")
         metrics = {"skill_name": SKILL_NAME, "optimizer": "dspy.GEPA",
+                   "lm_route": {role: getattr(lm, "route", type(lm).__name__)
+                                for role, lm in (("task", task_lm),
+                                                 ("reflection", reflection_lm))},
                    "max_metric_calls": max_metric_calls, "seed": seed,
                    "gepa_train_cases": GEPA_TRAIN_CASES,
                    "gepa_val_cases": len(examples) - GEPA_TRAIN_CASES,
@@ -557,7 +598,7 @@ class FullRun:
                     "status": status, "result": result,
                     "reason": result.get("reason") if status == "skipped" else None,
                     "seconds": round(time.perf_counter() - started, 1)}
-            except (BudgetExhausted, CanaryFailed) as exc:
+            except (BudgetExhausted, CanaryFailed, GepaCallFailed) as exc:
                 self.state["stages"][stage] = {"status": "stopped",
                                                "reason": redact(f"{type(exc).__name__}: {exc}")}
                 return
@@ -672,6 +713,118 @@ def stub_gepa_factory(max_metric_calls: int, *, stub_cost_usd: float = 0.0):
     return factory
 
 
+# ------------------------------------------------------- GEPA through Hermes
+
+def _parts_text(parts) -> str:
+    from dspy.lm15 import TextPart
+    if isinstance(parts, str):
+        return parts
+    texts = []
+    for part in parts or ():
+        if not isinstance(part, TextPart):
+            raise GepaCallFailed(f"non-text request part {type(part).__name__} cannot go "
+                                 "through Hermes")
+        texts.append(part.text)
+    return "".join(texts)
+
+
+class HermesEngine:
+    """dspy ``Engine`` that sends each completion through ``HermesExecutor``.
+
+    The request's system text becomes the Hermes strategy's system prompt and
+    its messages become the task prompt, so GEPA runs on the same provider,
+    model and bridge as every other stage (subscription-billed; the ledger
+    records Hermes' estimated cost). Each call is reserved against and
+    recorded in the run ledger through ``LedgerExecutor``. Fails closed: an
+    error, unknown cost, empty reply or policy violation is recorded and
+    raised, and every later call is refused without being made. There is no
+    fallback to LiteLLM or any other provider.
+    """
+
+    def __init__(self, executor: LedgerExecutor, *, role: str):
+        self.executor, self.role = executor, role
+        self.failures: list[str] = []
+
+    def complete(self, request):
+        from dspy.clients.engines.base import validate_request
+        from dspy.lm15 import Message, Response, TextPart, Usage
+
+        validate_request(request)
+        if self.failures:
+            raise GepaCallFailed(f"gepa:{self.role}: refused after an earlier failure")
+        if request.tools:
+            raise GepaCallFailed("tool definitions cannot go through Hermes (tool-free arm)")
+        system = _parts_text(request.system) if request.system is not None else ""
+        turns = [(m.role, _parts_text(m.parts)) for m in request.messages]
+        prompt = (turns[0][1] if len(turns) == 1 and turns[0][0] == "user" else
+                  "\n\n".join(f"[{role}]\n{text}" for role, text in turns))
+        task = Task(f"gepa-{self.role}-{_sha256(system + chr(0) + prompt)[:12]}", prompt)
+        out = self.executor.execute(task, Strategy(f"gepa-{self.role}", system_prompt=system))
+        problem = (out.error or ("unknown cost" if out.cost_usd is None else None)
+                   or ("empty reply" if not out.output.strip() else None)
+                   or (f"violation {list(out.violation_reasons)}" if out.violation_reasons
+                       else None))
+        if problem:
+            self.failures.append(redact(f"{task.task_id}: {problem}")[:300])
+            raise GepaCallFailed(self.failures[-1])
+        usage = Usage(input_tokens=out.input_tokens or 0, output_tokens=out.output_tokens or 0,
+                      total_tokens=(out.input_tokens or 0) + (out.output_tokens or 0))
+        return Response(id=None, model=out.model or self.executor.inner.model,
+                        message=Message.assistant([TextPart(out.output)]),
+                        finish_reason="stop", usage=usage)
+
+    def stream(self, request):
+        from dspy.lm15 import response_to_events
+        return response_to_events(self.complete(request))
+
+    def close(self):
+        pass
+
+
+class AsyncHermesEngine:
+    def __init__(self, sync: HermesEngine):
+        self.sync = sync
+
+    async def complete(self, request):
+        return self.sync.complete(request)
+
+    async def stream(self, request):
+        for event in self.sync.stream(request):
+            yield event
+
+    async def aclose(self):
+        pass
+
+
+def hermes_lm(executor: LedgerExecutor, *, role: str, max_tokens: int):
+    from dspy.clients.base_lm import BaseLM
+
+    engine = HermesEngine(executor, role=role)
+    inner = executor.inner
+    lm = BaseLM(f"hermes/{inner.model}", "chat", None, max_tokens, False, num_retries=0,
+                engine=engine, async_engine=AsyncHermesEngine(engine))
+    lm.hermes_engine = engine
+    lm.route = f"hermes:{inner.provider}:{inner.model}"
+    return lm
+
+
+def hermes_gepa_factory(base: HermesExecutor):
+    """GEPA task and reflection LMs over Hermes, same model/provider/runner as ``base``."""
+    def factory(ledger):
+        lms = []
+        for role, max_tokens in (("task", GEPA_TASK_MAX_TOKENS),
+                                 ("reflection", GEPA_REFLECTION_MAX_TOKENS)):
+            inner = HermesExecutor(hermes_repo=base.hermes_repo, python=base.python,
+                                   model=base.model, provider=base.provider,
+                                   budget=Budget(max_tokens=max_tokens), allow_live=True,
+                                   runner=base._runner)
+            ex = LedgerExecutor(inner, ledger, stage=f"gepa:{role}", retries=0,
+                                reserve_usd=call_reserve_usd(max_tokens))
+            lms.append(hermes_lm(ex, role=role, max_tokens=max_tokens))
+        return tuple(lms)
+    return factory
+
+
 # ---------------------------------------------------------------------- CLI
 
 def _inside_repo(path: Path) -> bool:
@@ -699,6 +852,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--train-episodes", type=int, default=300)
     p.add_argument("--gepa-allow-metered", action="store_true",
                    help="live GEPA bills ANTHROPIC_API_KEY (metered), not the Hermes provider")
+    p.add_argument("--gepa-via-hermes", action="store_true",
+                   help="route GEPA task and reflection calls through Hermes (same model "
+                        "and provider as the other stages; no metered API key)")
     p.add_argument("--gepa-task-model", default="anthropic/claude-sonnet-5-5")
     p.add_argument("--gepa-reflection-model", default="anthropic/claude-sonnet-5-5")
     p.add_argument("--gepa-max-metric-calls", type=int, default=150)
@@ -714,9 +870,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.live and (not args.model or args.stop_usd is None):
         p.error("--live needs explicit --model and --stop-usd")
     stop = DEFAULT_STOP_USD if args.stop_usd is None else args.stop_usd
+    if args.gepa_via_hermes and args.gepa_allow_metered:
+        p.error("--gepa-via-hermes and --gepa-allow-metered are mutually exclusive")
     gepa_factory = None
+    gepa_via_hermes = False
     if "gepa" in stages:
-        if not args.live:
+        if args.gepa_via_hermes:
+            gepa_via_hermes = True          # factory built once the executor exists
+        elif not args.live:
             try:
                 import dspy  # noqa: F401
                 gepa_factory = stub_gepa_factory(args.gepa_max_metric_calls)
@@ -727,8 +888,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 p.error("live GEPA needs ANTHROPIC_API_KEY in the environment")
             gepa_factory = live_gepa_factory(args.gepa_task_model, args.gepa_reflection_model)
         else:
-            p.error("live GEPA is metered API spend: pass --gepa-allow-metered, "
-                    "or leave gepa out of --stages")
+            p.error("live GEPA needs --gepa-via-hermes (subscription) or "
+                    "--gepa-allow-metered (metered API key), or leave gepa out of --stages")
     if args.live:
         try:
             from . import admission as adm
@@ -744,6 +905,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                               model=args.model or "stub-model", provider=args.provider,
                               budget=Budget(), allow_live=True,
                               runner=None if args.live else stub_runner)
+    if gepa_via_hermes:
+        gepa_factory = hermes_gepa_factory(executor)
     ledger = SpendLedger(run_dir / "ledger.jsonl", stop_usd=stop)
     run = FullRun(run_dir=run_dir, skill_text=skill_text,
                   skill_source=args.skill_source or str(args.skill_file), executor=executor,

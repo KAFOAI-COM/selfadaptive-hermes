@@ -162,7 +162,8 @@ def test_review_prompt_matches_admission_when_available():
 
 @pytest.mark.parametrize("extra, message", [
     (["--live"], "--live needs explicit --model and --stop-usd"),
-    (["--live", "--model", "m", "--stop-usd", "5", "--stages", "gepa"], "--gepa-allow-metered"),
+    (["--live", "--model", "m", "--stop-usd", "5", "--stages", "gepa"], "--gepa-via-hermes"),
+    (["--gepa-via-hermes", "--gepa-allow-metered"], "mutually exclusive"),
 ])
 def test_cli_refuses_unsafe_live_invocations(tmp_path, capsys, extra, message):
     skill = tmp_path / "skill.md"
@@ -262,3 +263,52 @@ def test_admission_uses_review_with_rollback(tmp_path, hermes_repo, better, stat
     # gate 7's catalogue arm is measured with its own calls, not gate 6's replays
     assert report["spend"]["by_stage"]["admission"]["calls"] >= 60
     assert report["sealed_split_open_attempts"] == 0
+
+
+# ------------------------------------------------------ GEPA through Hermes
+
+def test_gepa_via_hermes_uses_the_bridge_and_the_ledger(tmp_path, hermes_repo, monkeypatch):
+    _require_gepa()
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)     # no metered key needed
+    run = make_run(tmp_path, hermes_repo)
+    report = run.run(["gepa"], gepa_factory=fr.hermes_gepa_factory(run.executor),
+                     gepa_max_metric_calls=20)
+    gepa = report["stages"]["gepa"]
+    assert gepa["status"] == "done", gepa
+    route = gepa["result"]["metrics"]["lm_route"]
+    assert route == {"task": "hermes:stub:stub-model", "reflection": "hermes:stub:stub-model"}
+    spend = report["spend"]["by_stage"]
+    assert spend["gepa:task"]["calls"] > 0 and spend["gepa:reflection"]["calls"] > 0
+    assert spend["gepa:task"]["cost_usd"] > 0                  # stub estimates are recorded
+    rows = [r for r in run.ledger.rows if r["stage"].startswith("gepa:")]
+    assert rows and all(r["kind"] == "hermes" and r["backend"] == "hermes" for r in rows)
+
+
+def test_gepa_via_hermes_fails_closed(tmp_path, hermes_repo):
+    _require_gepa()
+    calls = {"gepa": 0}
+
+    def flaky(argv, cwd=None, **kw):
+        request = json.load(open(argv[-2]))
+        if "Your output fields are:" in (request.get("system_prompt") or ""):   # any DSPy call
+            calls["gepa"] += 1
+            if calls["gepa"] > 3:                                 # fail after the preflight
+                return subprocess.CompletedProcess(argv, 1, "", "bridge down")
+        return fr.stub_runner(argv, cwd=cwd, **kw)
+
+    run = make_run(tmp_path, hermes_repo, runner=flaky)
+    report = run.run(["gepa"], gepa_factory=fr.hermes_gepa_factory(run.executor),
+                     gepa_max_metric_calls=20)
+    gepa = report["stages"]["gepa"]
+    assert gepa["status"] == "stopped" and "GepaCallFailed" in gepa["reason"]
+    assert calls["gepa"] == 4                                     # no calls after the failure
+    assert not (run.run_dir / "gepa").exists()
+
+
+def test_gepa_via_hermes_respects_the_stop(tmp_path, hermes_repo):
+    _require_gepa()
+    run = make_run(tmp_path, hermes_repo, stop_usd=0.25)
+    report = run.run(["gepa"], gepa_factory=fr.hermes_gepa_factory(run.executor),
+                     gepa_max_metric_calls=40)
+    assert report["stages"]["gepa"]["status"] == "stopped"
+    assert report["spend"]["spent_usd"] <= 0.25
