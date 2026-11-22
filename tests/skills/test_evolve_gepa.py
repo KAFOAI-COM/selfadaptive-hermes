@@ -40,7 +40,12 @@ BAD = "nothing relevant here"
 # ── stub LMs ─────────────────────────────────────────────────────────────────
 
 class _RespondEngine(DummyEngine):
-    """Answers from ``owner.respond(system_prompt, last_user_message) -> fields``."""
+    """Answers from ``owner.respond(system_prompt, last_user_message) -> fields``.
+
+    dspy 3.5 ChainOfThought: without native reasoning, its ``dspy.Reasoning``
+    field goes over the wire as ``plan`` (``__dspy_reasoning_fallback``), so
+    stub answers use ``plan`` rather than ``reasoning``.
+    """
 
     def _complete_messages(self, messages):
         system = next((m["content"] for m in messages if m["role"] == "system"), "")
@@ -69,7 +74,7 @@ class StubLM(DummyLM):
 
 def task_lm():
     def respond(system, user):
-        return {"reasoning": "stub reasoning", "output": GOOD if MARKER in system else BAD}
+        return {"plan": "stub plan", "output": GOOD if MARKER in system else BAD}
     return StubLM(respond)
 
 
@@ -101,7 +106,7 @@ def test_skill_text_reaches_the_lm_as_instructions():
 
     def respond(system, user):
         seen["system"], seen["user"] = system, user
-        return {"reasoning": "r", "output": "ok"}
+        return {"plan": "p", "output": "ok"}
 
     with dspy.context(lm=StubLM(respond)):
         assert SkillModule(BODY)(task_input="Review this.").output == "ok"
@@ -228,7 +233,7 @@ def test_judge_metric_scores_rubric_without_seeing_the_skill():
 
     def respond(system, user):
         prompts.append(system + user)
-        return {"reasoning": "r", "correctness": 1.0, "procedure_following": 0.5,
+        return {"plan": "p", "correctness": 1.0, "procedure_following": 0.5,
                 "conciseness": 0.0, "feedback": "Name the failing edge case."}
 
     metric = fitness.make_skill_metric("judge", judge_lm=StubLM(respond))
