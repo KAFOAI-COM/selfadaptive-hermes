@@ -52,6 +52,7 @@ import re
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Callable, Mapping, Optional, Sequence
 
@@ -556,7 +557,7 @@ class FullRun:
         if recorded != identity:
             changed = sorted(k for k in identity if recorded.get(k) != identity[k])
             raise RunMismatch(f"{self.run_dir} belongs to another run (differs in {changed}); "
-                              "use a new --run-dir")
+                              "use a new --run-dir or --run-name")
         self.state.setdefault("baseline_id",
                               f"{SKILL_NAME}@{identity['skill_sha256'][:12]}")
         sealed_before = bm._sealed_attempts
@@ -827,6 +828,41 @@ def hermes_gepa_factory(base: HermesExecutor):
 
 # ---------------------------------------------------------------------- CLI
 
+EVOLUTION_HOME_ENV = "HERMES_EVOLUTION_HOME"
+
+
+def evolution_home(env: Optional[Mapping[str, str]] = None) -> Path:
+    """Persistent root for run results: $HERMES_EVOLUTION_HOME, else
+    ~/.local/share/hermes-evolution. Run dirs live under <home>/runs/."""
+    env = os.environ if env is None else env
+    raw = env.get(EVOLUTION_HOME_ENV)
+    return Path(raw).expanduser() if raw else Path.home() / ".local" / "share" / "hermes-evolution"
+
+
+def default_run_dir(run_name: str, env: Optional[Mapping[str, str]] = None) -> Path:
+    """<evolution home>/runs/<run_name>; run_name may nest, e.g. kafo-evo-001/live-2."""
+    name = Path(run_name)
+    if not run_name or name.is_absolute() or ".." in name.parts:
+        raise ValueError(f"--run-name must be a relative name without '..': {run_name!r}")
+    return evolution_home(env) / "runs" / name
+
+
+def _under_tmpdir(path: Path, env: Optional[Mapping[str, str]] = None) -> bool:
+    """True when ``path`` sits in a temporary directory the OS may clear."""
+    env = os.environ if env is None else env
+    roots = {tempfile.gettempdir(), "/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"}
+    if env.get("TMPDIR"):
+        roots.add(env["TMPDIR"])
+    target = path.expanduser().resolve()
+    for root in roots:
+        try:
+            target.relative_to(Path(root).resolve())
+            return True
+        except (ValueError, OSError):
+            continue
+    return False
+
+
 def _inside_repo(path: Path) -> bool:
     repo = Path(__file__).resolve().parents[2]
     try:
@@ -838,7 +874,12 @@ def _inside_repo(path: Path) -> bool:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--run-dir", required=True, help="state, ledger and report (outside the repo)")
+    p.add_argument("--run-dir", default=None,
+                   help="state, ledger and report (outside the repo); default "
+                        f"${EVOLUTION_HOME_ENV}/runs/<--run-name>")
+    p.add_argument("--run-name", default=None,
+                   help="run dir name under the persistent root, e.g. kafo-evo-001/live-2 "
+                        f"(${EVOLUTION_HOME_ENV}, default ~/.local/share/hermes-evolution)")
     p.add_argument("--skill-file", required=True, help="baseline skill text (read only)")
     p.add_argument("--skill-source", default=None, help="provenance note for the skill file")
     p.add_argument("--stages", default=",".join(STAGES))
@@ -864,9 +905,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     unknown = set(stages) - set(STAGES)
     if unknown:
         p.error(f"unknown stages {sorted(unknown)}")
-    run_dir = Path(args.run_dir)
+    if args.run_dir and args.run_name:
+        p.error("give --run-dir or --run-name, not both")
+    if args.run_dir:
+        run_dir = Path(args.run_dir).expanduser()
+    elif args.run_name:
+        try:
+            run_dir = default_run_dir(args.run_name)
+        except ValueError as exc:
+            p.error(str(exc))
+    else:
+        p.error(f"give --run-name (stored under ${EVOLUTION_HOME_ENV}/runs, default "
+                "~/.local/share/hermes-evolution/runs) or an explicit --run-dir")
     if _inside_repo(run_dir):
         p.error("--run-dir must be outside the repository")
+    if _under_tmpdir(run_dir):
+        print(f"WARNING: run dir {run_dir} is in a temporary directory the OS may clear; "
+              f"results and the registry could be lost. Use --run-name to store it under "
+              f"{evolution_home() / 'runs'} (${EVOLUTION_HOME_ENV}).", file=sys.stderr)
     if args.live and (not args.model or args.stop_usd is None):
         p.error("--live needs explicit --model and --stop-usd")
     stop = DEFAULT_STOP_USD if args.stop_usd is None else args.stop_usd

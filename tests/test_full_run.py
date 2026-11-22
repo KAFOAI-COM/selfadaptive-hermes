@@ -181,6 +181,62 @@ def test_cli_refuses_a_run_dir_inside_the_repo(tmp_path, capsys):
     assert "outside the repository" in capsys.readouterr().err
 
 
+# ------------------------------------------------- persistent run-dir default
+
+def test_evolution_home_defaults_and_env_override(tmp_path):
+    assert fr.evolution_home({}) == fr.Path.home() / ".local" / "share" / "hermes-evolution"
+    env = {fr.EVOLUTION_HOME_ENV: str(tmp_path / "evo")}
+    assert fr.evolution_home(env) == tmp_path / "evo"
+    assert fr.default_run_dir("kafo-evo-001/live-2", env) == tmp_path / "evo" / "runs" / "kafo-evo-001" / "live-2"
+
+
+@pytest.mark.parametrize("name", ["", "/abs/run", "../escape", "a/../../b"])
+def test_default_run_dir_rejects_unsafe_names(name):
+    with pytest.raises(ValueError):
+        fr.default_run_dir(name, {})
+
+
+def test_under_tmpdir(tmp_path):
+    env = {"TMPDIR": str(tmp_path)}
+    assert fr._under_tmpdir(tmp_path / "kafo-fullrun" / "live-1", env)
+    assert fr._under_tmpdir(fr.Path("/tmp/x"), {})
+    assert not fr._under_tmpdir(fr.Path("/nonexistent-persistent/hermes-evolution/runs/x"), {})
+
+
+def _cli_err(capsys, argv):
+    with pytest.raises(SystemExit):
+        fr.main(argv)
+    return capsys.readouterr().err
+
+
+def test_cli_run_name_uses_the_persistent_root_without_warning(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv(fr.EVOLUTION_HOME_ENV, "/nonexistent-persistent/hermes-evolution")
+    skill = tmp_path / "skill.md"
+    skill.write_text("skill")
+    err = _cli_err(capsys, ["--run-name", "kafo-evo-001/live-2", "--skill-file", str(skill), "--live"])
+    assert "--live needs explicit --model" in err           # got past run-dir resolution
+    assert "WARNING" not in err
+
+
+def test_cli_warns_when_the_run_dir_is_in_tmpdir(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    skill = tmp_path / "skill.md"
+    skill.write_text("skill")
+    err = _cli_err(capsys, ["--run-dir", str(tmp_path / "run"), "--skill-file", str(skill), "--live"])
+    assert "WARNING" in err and "temporary directory" in err and fr.EVOLUTION_HOME_ENV in err
+
+
+@pytest.mark.parametrize("args, message", [
+    ([], "give --run-name"),
+    (["--run-dir", "/nonexistent-persistent/r", "--run-name", "x"], "not both"),
+    (["--run-name", "../x"], "without '..'"),
+])
+def test_cli_run_dir_selection_errors(tmp_path, capsys, args, message):
+    skill = tmp_path / "skill.md"
+    skill.write_text("skill")
+    assert message in _cli_err(capsys, [*args, "--skill-file", str(skill)])
+
+
 def test_gepa_budget_stop_terminates_the_stage(tmp_path, hermes_repo):
     _require_gepa()
     run = make_run(tmp_path, hermes_repo, stop_usd=0.05)
