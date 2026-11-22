@@ -128,8 +128,9 @@ Hermes improves on any real task.**
       (`evolution/adaptive/checkpoint.py`, PR #9; 45 offline tests, full suite
       475 passed on GitHub Actions. See "Checkpoint and rollback (gate 7)".
       Limits: the trigger wraps a caller-supplied `admit`, because the admission
-      gates are still open; skill rollback restores the skill version ID only.
-      Synthetic data only.)
+      gate (candidate-vs-baseline validation) is still open; skill rollback
+      restores the skill version ID only and is not yet wired to the gate 5
+      candidate registry. Synthetic data only.)
 - [ ] Publish quality, utility, cost, latency, uncertainty and safety report.
 
 ## Hermes executor (gate 1)
@@ -343,8 +344,10 @@ points are in the guarded list in `tests/test_benchmark_integration.py`.
 
 ### Limits
 
-- No candidate-admission gate exists yet (gates 5 and 6). The trigger is a
-  callable the future admission step runs; `admit` is supplied by the caller.
+- No candidate-admission gate exists yet (candidate-vs-baseline validation is
+  still open). The trigger is a callable the future admission step runs;
+  `admit` is supplied by the caller. The gate 5 registry (`registry.py`) is not
+  yet wired in: `skill_version` is a free string, not a registry candidate ID.
 - The skill version is an identifier only. Restore and rollback return it;
   nothing deploys, rewrites or rolls back skill files.
 - Checkpoint status is lifecycle metadata outside the checksum. The checksum
